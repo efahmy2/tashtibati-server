@@ -11,7 +11,7 @@ const PACKAGE = process.env.PACKAGE_NAME || 'com.efahmy.finishingprojects';
 const PRODUCT_ID = process.env.PRODUCT_ID || 'tashtibati_full';
 const ADMIN_USER = process.env.ADMIN_USER || '';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
-const CONTACT = process.env.CONTACT_EMAIL || '[CONTACT EMAIL]';
+const CONTACT = process.env.CONTACT_EMAIL || 'fahmy.ehab2@gmail.com';
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.PGSSL === '1' ? { rejectUnauthorized: false } : false, max: 5 });
 const q = (sql, args) => pool.query(sql, args).then(r => r.rows);
