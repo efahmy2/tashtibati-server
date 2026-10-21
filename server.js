@@ -11,6 +11,7 @@ const PACKAGE = process.env.PACKAGE_NAME || 'com.efahmy.finishingprojects';
 const PRODUCT_ID = process.env.PRODUCT_ID || 'tashtibati_full';
 const ADMIN_USER = process.env.ADMIN_USER || '';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';   // OAuth "Web application" client id (same Google Cloud project as the Android client)
 const CONTACT = process.env.CONTACT_EMAIL || 'fahmy.ehab2@gmail.com';
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.PGSSL === '1' ? { rejectUnauthorized: false } : false, max: 5 });
@@ -31,6 +32,9 @@ async function migrate() {
     create table if not exists sessions (
       token_hash text primary key, account_id int not null references accounts(id) on delete cascade,
       device_row int references devices(id) on delete cascade, created_at timestamptz not null default now(), last_seen timestamptz not null default now());
+    alter table accounts add column if not exists google_sub text unique;
+    alter table accounts add column if not exists email text;
+    alter table accounts add column if not exists display_name text;
     create table if not exists purchases (
       id serial primary key, account_id int references accounts(id) on delete set null, token text not null unique,
       order_id text, product_id text, state text not null, detail jsonb, created_at timestamptz not null default now());
@@ -68,7 +72,7 @@ setInterval(() => { const now = Date.now(); for (const [k, h] of hits) if (now >
 function stateOf(acc) { if (acc.paid) return 'paid'; return new Date(acc.trial_ends) > new Date() ? 'trial' : 'expired'; }
 async function statusPayload(acc, deviceRow) {
   const devs = await q('select id, kind, model, last_seen from devices where account_id=$1 and active order by kind', [acc.id]);
-  return { ok: true, username: acc.username, accountId: acc.public_id, state: stateOf(acc), trialEnds: acc.trial_ends, paidAt: acc.paid_at,
+  return { ok: true, username: acc.username, displayName: acc.display_name || '', email: acc.email || '', google: !!acc.google_sub, accountId: acc.public_id, state: stateOf(acc), trialEnds: acc.trial_ends, paidAt: acc.paid_at,
     serverTime: new Date().toISOString(), productId: PRODUCT_ID, trialDays: TRIAL_DAYS,
     devices: devs.map(d => ({ kind: d.kind, model: d.model, lastSeen: d.last_seen, current: d.id === deviceRow })) };
 }
@@ -135,7 +139,32 @@ async function verifyPlay(token, productId) {
 // ---------- API ----------
 const routes = {
   'GET /health': async () => ({ ok: true, db: dbReady }),
-  'GET /api/config': async () => ({ ok: true, productId: PRODUCT_ID, trialDays: TRIAL_DAYS }),
+  'GET /api/config': async () => ({ ok: true, productId: PRODUCT_ID, trialDays: TRIAL_DAYS, googleClientId: GOOGLE_CLIENT_ID }),
+
+  // Sign in with Google: the app sends the Google ID token; Google confirms it; first sign-in creates the account
+  'POST /api/google': async (req, b) => {
+    limit('google:' + req.ip, 30, 600e3);
+    if (!GOOGLE_CLIENT_ID) throw new HttpErr(503, 'googleNotConfigured');
+    const r = await fetch('https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(String(b.idToken || ''))).catch(() => { throw new HttpErr(502, 'googleUnreachable'); });
+    const g = await r.json().catch(() => ({}));
+    if (!r.ok || g.aud !== GOOGLE_CLIENT_ID || !/^(https:\/\/)?accounts\.google\.com$/.test(g.iss || '') || +g.exp * 1000 < Date.now() || !g.sub) throw new HttpErr(401, 'badGoogle');
+    const dev = readDevice(b);
+    let [acc] = await q('select * from accounts where google_sub=$1', [g.sub]);
+    let created = false, usedTrial = null;
+    if (!acc) {
+      const base = (String(g.email || 'user').split('@')[0].toLowerCase().replace(/[^a-z0-9._-]/g, '') || 'user').slice(0, 24).padEnd(3, '0');
+      let username = base;
+      for (let i = 0; i < 50; i++) { const [x] = await q('select 1 from accounts where username=$1', [username]); if (!x) break; username = base + (Math.floor(Math.random() * 9000) + 1000); }
+      [usedTrial] = await q('select 1 from trial_devices where device_id=$1', [dev.id]);
+      const trialEnds = usedTrial ? new Date() : new Date(Date.now() + TRIAL_DAYS * 864e5);
+      [acc] = await q(`insert into accounts(public_id, username, pass_hash, trial_ends, google_sub, email, display_name) values($1,$2,$3,$4,$5,$6,$7) returning *`,
+        [crypto.randomUUID(), username, 'google', trialEnds, g.sub, g.email_verified === 'true' || g.email_verified === true ? g.email : null, String(g.name || b.name || '').slice(0, 80)]);
+      if (!usedTrial) await q('insert into trial_devices(device_id, account_id) values($1,$2) on conflict do nothing', [dev.id, acc.id]);
+      created = true;
+    } else if (g.name && g.name !== acc.display_name) { await q('update accounts set display_name=$2 where id=$1', [acc.id, String(g.name).slice(0, 80)]); acc.display_name = g.name; }
+    const row = await attachDevice(acc, dev);
+    return { ...(await statusPayload(acc, row)), token: await newSession(acc, row), created, trialUsedOnDevice: !!usedTrial };
+  },
 
   'POST /api/register': async (req, b) => {
     limit('reg:' + req.ip, 10, 3600e3);
@@ -204,7 +233,8 @@ const routes = {
 
   'POST /api/delete-account': async (req, b) => {
     const s = await auth(req);
-    if (!checkPassword(String(b.password || ''), s.pass_hash)) throw new HttpErr(401, 'badLogin');
+    const ok = s.google_sub && s.pass_hash === 'google' ? normUser(b.confirm) === s.username : checkPassword(String(b.password || ''), s.pass_hash);
+    if (!ok) throw new HttpErr(401, 'badLogin');
     await q('delete from accounts where id=$1', [s.id]);
     return { ok: true };
   },
@@ -213,7 +243,7 @@ const routes = {
   'GET /admin/api/accounts': async (req, b, url) => {
     adminAuth(req);
     const term = '%' + (url.searchParams.get('q') || '').toLowerCase() + '%';
-    const rows = await q(`select a.id, a.username, a.created_at, a.trial_ends, a.paid, a.paid_at, a.paid_via, a.note,
+    const rows = await q(`select a.id, a.username, a.email, a.google_sub is not null as google, a.created_at, a.trial_ends, a.paid, a.paid_at, a.paid_via, a.note,
         (select json_agg(json_build_object('id', d.id, 'kind', d.kind, 'model', d.model, 'lastSeen', d.last_seen)) from devices d where d.account_id=a.id and d.active) as devices,
         (select json_agg(json_build_object('order', p.order_id, 'state', p.state, 'at', p.created_at)) from purchases p where p.account_id=a.id) as purchases
       from accounts a where a.username like $1 order by a.created_at desc limit 300`, [term]);
@@ -282,7 +312,7 @@ const d=x=>x?new Date(x).toLocaleString('ar-EG-u-nu-latn',{dateStyle:'medium',ti
 const st={paid:'مدفوع',trial:'تجريبي',expired:'انتهت التجربة'};
 async function load(){const r=await fetch('/admin/api/accounts?q='+encodeURIComponent($('#q').value));const j=await r.json();
  $('#tot').innerHTML='الحسابات: <b>'+j.totals.all+'</b> · مدفوع: <b>'+j.totals.paid+'</b> · في التجربة: <b>'+j.totals.trial+'</b>';
- $('#rows').innerHTML=j.accounts.map(a=>'<tr><td><b>'+esc(a.username)+'</b><br><span class="muted">'+d(a.created_at)+'</span>'+(a.note?'<br><span class="muted">'+esc(a.note)+'</span>':'')+'</td>'+
+ $('#rows').innerHTML=j.accounts.map(a=>'<tr><td><b>'+esc(a.username)+'</b>'+(a.google?' <span class="pill trial">Google</span>':'')+(a.email?'<br><span class="muted">'+esc(a.email)+'</span>':'')+'<br><span class="muted">'+d(a.created_at)+'</span>'+(a.note?'<br><span class="muted">'+esc(a.note)+'</span>':'')+'</td>'+
  '<td><span class="pill '+a.state+'">'+st[a.state]+'</span><br><span class="muted">'+(a.paid?('منذ '+d(a.paid_at)+' · '+esc(a.paid_via||'')):('حتى '+d(a.trial_ends)))+'</span></td>'+
  '<td>'+((a.devices||[]).map(x=>esc(x.kind==='tablet'?'تابلت':'هاتف')+' '+esc(x.model)+' <button class="ghost" data-a="removeDevice" data-id="'+a.id+'" data-dev="'+x.id+'">إزالة</button><br><span class="muted">'+d(x.lastSeen)+'</span>').join('<br>')||'—')+'</td>'+
  '<td>'+((a.purchases||[]).map(p=>esc(p.order||'')+' <b>'+esc(p.state)+'</b>').join('<br>')||'—')+'</td>'+
