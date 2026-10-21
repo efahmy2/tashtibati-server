@@ -134,7 +134,7 @@ async function verifyPlay(token, productId) {
 
 // ---------- API ----------
 const routes = {
-  'GET /health': async () => ({ ok: true }),
+  'GET /health': async () => ({ ok: true, db: dbReady }),
   'GET /api/config': async () => ({ ok: true, productId: PRODUCT_ID, trialDays: TRIAL_DAYS }),
 
   'POST /api/register': async (req, b) => {
@@ -310,6 +310,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/delete-account') return send(res, 200, DELETE_PAGE, 'text/html; charset=utf-8');
     if (req.method === 'GET' && url.pathname === '/admin') { adminAuth(req); return send(res, 200, ADMIN_PAGE, 'text/html; charset=utf-8'); }
     const h = routes[`${req.method} ${url.pathname}`];
+    if (h && !dbReady && url.pathname !== '/health') throw new HttpErr(503, 'starting');
     if (!h) return send(res, 404, { ok: false, error: 'notFound' });
     let body = {};
     if (req.method === 'POST') {
@@ -323,7 +324,11 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-if (require.main === module) {
-  migrate().then(() => server.listen(PORT, () => console.log('tashtibati server on', PORT))).catch(e => { console.error(e); process.exit(1); });
+let dbReady = false;
+async function connectDb() {
+  if (!process.env.DATABASE_URL) { console.error('DATABASE_URL is not set: add the database Internal URL in the service environment'); return setTimeout(connectDb, 30000); }
+  try { await migrate(); dbReady = true; console.log('database ready'); } catch (e) { console.error('database not ready:', e.message); setTimeout(connectDb, 10000); }
 }
+if (require.main === module) { server.listen(PORT, () => console.log('tashtibati server on', PORT)); connectDb(); }
+else dbReady = true;
 module.exports = { server, migrate, pool };
