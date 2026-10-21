@@ -355,9 +355,18 @@ const server = http.createServer(async (req, res) => {
 });
 
 let dbReady = false;
+// optional: SEED_USER / SEED_PASSWORD create (or reset) one activated account at start-up, for testing
+async function seedTestUser() {
+  const u = normUser(process.env.SEED_USER || ''), pw = process.env.SEED_PASSWORD || '';
+  if (!u || pw.length < 8) return;
+  const [acc] = await q('select id from accounts where username=$1', [u]);
+  if (acc) await q(`update accounts set pass_hash=$2, paid=true, paid_at=coalesce(paid_at, now()), paid_via=coalesce(paid_via,'test') where id=$1`, [acc.id, hashPassword(pw)]);
+  else await q(`insert into accounts(public_id, username, pass_hash, trial_ends, paid, paid_at, paid_via) values($1,$2,$3,now(),true,now(),'test')`, [crypto.randomUUID(), u, hashPassword(pw)]);
+  console.log('test account ready:', u);
+}
 async function connectDb() {
   if (!process.env.DATABASE_URL) { console.error('DATABASE_URL is not set: add the database Internal URL in the service environment'); return setTimeout(connectDb, 30000); }
-  try { await migrate(); dbReady = true; console.log('database ready'); } catch (e) { console.error('database not ready:', e.message); setTimeout(connectDb, 10000); }
+  try { await migrate(); await seedTestUser(); dbReady = true; console.log('database ready'); } catch (e) { console.error('database not ready:', e.message); setTimeout(connectDb, 10000); }
 }
 if (require.main === module) { server.listen(PORT, () => console.log('tashtibati server on', PORT)); connectDb(); }
 else dbReady = true;
