@@ -276,12 +276,19 @@ ${kb}`;
         console.error('support ai', r.status, j.error && j.error.message);
       } catch (e) { console.error('support ai', e.message); }
     }
+    // no assistant configured (or it failed): problems that need a person go straight to support
+    if (/استرجاع|استرداد|فلوس|اتخصم|خصم|مرتين|دفع|refund|charged|twice|payment|نسيت|forgot|password|كلمة المرور|ضاع|اتمسح|lost|deleted|bug|crash|بيقفل|مش شغال|عطل|error|خطأ|محظور|blocked|سرق|stolen/i.test(last))
+      return { ok: true, reply: lang === 'ar' ? `هذه المشكلة تحتاج فريق الدعم. اضغط «إرسال للدعم» وسنتواصل معك على ${SUPPORT_EMAIL}.` : `This needs the support team. Tap “Send to support” and we will reply from ${SUPPORT_EMAIL}.`, escalate: true, ai: false };
     // no assistant configured (or it failed): answer from the closest help article
-    const words = s2 => String(s2).toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter(w => w.length > 2);
+    // rough Arabic / English word stems, enough to find the right help article
+    const stem = w => /[\u0600-\u06ff]/.test(w) ? w.replace(/[\u064b-\u0652]/g, '').replace(/[أإآ]/g, 'ا').replace(/ة/g, 'ه').replace(/ى/g, 'ي').replace(/^(وال|بال|كال|فال|لل|ال)/, '').slice(0, 3) : w.replace(/(ing|ed|es|s)$/, '');
+    const STOP = new Set(['ازا', 'ايه', 'عاي', 'لما', 'ممك', 'how', 'what', 'the', 'can', 'and', 'for', 'with', 'from', 'into', 'this', 'that']);
+    const words = s2 => String(s2).toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter(w => w.length > 2).map(stem).filter(w => w.length > 2 && !STOP.has(w));
     const want = new Set(words(last)); let best = null, score = 0;
-    for (const a of HELP) { const t = words(a[lang].t + ' ' + a[lang].b + ' ' + a.en.t + ' ' + a.ar.t); const sc = t.filter(w => want.has(w)).length; if (sc > score) { score = sc; best = a; } }
+    for (const a of HELP) { const title = new Set(words(a.ar.t + ' ' + a.en.t)), body = new Set(words(a[lang].b));
+      let sc = 0; for (const w of want) { if (title.has(w)) sc += 3; else if (body.has(w)) sc += 1; } if (sc > score) { score = sc; best = a; } }
     const reply = best && score >= 1 ? `${best[lang].t}\n${best[lang].b}` : (lang === 'ar' ? 'لم أجد إجابة مناسبة في المساعدة. يمكنك إرسال المشكلة لفريق الدعم.' : 'I could not find an answer in the help. You can send this to the support team.');
-    return { ok: true, reply, escalate: !best || score < 2, ai: false };
+    return { ok: true, reply, escalate: !best || score < 3, ai: false };
   },
   'POST /api/support/ticket': async (req, b) => {
     limit('ticket:' + req.ip, 10, 3600e3);
