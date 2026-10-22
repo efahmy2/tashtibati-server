@@ -1,5 +1,6 @@
-// Tashtibati licence server: accounts (username + password), 7-day trial, one phone + one tablet per account,
-// Google Play one-time purchase, an admin page, and the privacy / account-deletion pages Google Play asks for.
+// Tashtibati licence server: accounts (username + password, Google or Apple), 7-day trial tied to the device,
+// one device per account (moving to a new device only after purchase; the old device is then blocked),
+// Google Play one-time purchase, a help / support assistant, an admin page, and the privacy / deletion pages.
 'use strict';
 const http = require('http');
 const crypto = require('crypto');
@@ -13,6 +14,14 @@ const ADMIN_USER = process.env.ADMIN_USER || '';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';   // OAuth "Web application" client id (same Google Cloud project as the Android client)
 const CONTACT = process.env.CONTACT_EMAIL || 'fahmy.ehab2@gmail.com';
+const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || 'fahmy.ehab2@gmail.com';
+const APPLE_CLIENT_ID = process.env.APPLE_CLIENT_ID || '';     // Apple "Services ID" used for Sign in with Apple on Android / web
+const PUBLIC_URL = (process.env.PUBLIC_URL || 'https://tashtibati.onrender.com').replace(/\/$/, '');
+const AI_KEY = process.env.ANTHROPIC_API_KEY || '';
+const AI_MODEL = process.env.SUPPORT_MODEL || 'claude-haiku-5-5';
+const HELP = require('./help.js');
+const LATEST_VERSION = process.env.LATEST_VERSION || '';           // newest app version, e.g. 2.2.0
+const UPDATE_URL = process.env.UPDATE_URL || 'https://play.google.com/store/apps/details?id=' + (process.env.PACKAGE_NAME || 'com.efahmy.finishingprojects');
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.PGSSL === '1' ? { rejectUnauthorized: false } : false, max: 5 });
 const q = (sql, args) => pool.query(sql, args).then(r => r.rows);
@@ -35,6 +44,15 @@ async function migrate() {
     alter table accounts add column if not exists google_sub text unique;
     alter table accounts add column if not exists email text;
     alter table accounts add column if not exists display_name text;
+    alter table accounts add column if not exists apple_sub text unique;
+    alter table devices add column if not exists revoked boolean not null default false;
+    alter table devices add column if not exists revoked_at timestamptz;
+    drop index if exists devices_one_per_kind;
+    update devices d set active=false where active and exists (select 1 from devices d2 where d2.account_id=d.account_id and d2.active and (d2.last_seen, d2.id) > (d.last_seen, d.id));
+    create unique index if not exists devices_one_active on devices(account_id) where active;
+    create table if not exists support_tickets (
+      id serial primary key, account_id int references accounts(id) on delete set null, username text, contact text,
+      subject text, message text, transcript jsonb, lang text, device text, status text not null default 'open', created_at timestamptz not null default now());
     create table if not exists purchases (
       id serial primary key, account_id int references accounts(id) on delete set null, token text not null unique,
       order_id text, product_id text, state text not null, detail jsonb, created_at timestamptz not null default now());
@@ -72,8 +90,9 @@ setInterval(() => { const now = Date.now(); for (const [k, h] of hits) if (now >
 function stateOf(acc) { if (acc.paid) return 'paid'; return new Date(acc.trial_ends) > new Date() ? 'trial' : 'expired'; }
 async function statusPayload(acc, deviceRow) {
   const devs = await q('select id, kind, model, last_seen from devices where account_id=$1 and active order by kind', [acc.id]);
-  return { ok: true, username: acc.username, displayName: acc.display_name || '', email: acc.email || '', google: !!acc.google_sub, accountId: acc.public_id, state: stateOf(acc), trialEnds: acc.trial_ends, paidAt: acc.paid_at,
+  return { ok: true, username: acc.username, displayName: acc.display_name || '', email: acc.email || '', google: !!acc.google_sub, apple: !!acc.apple_sub, social: ['google', 'apple'].includes(acc.pass_hash) ? acc.pass_hash : '', accountId: acc.public_id, state: stateOf(acc), trialEnds: acc.trial_ends, paidAt: acc.paid_at,
     serverTime: new Date().toISOString(), productId: PRODUCT_ID, trialDays: TRIAL_DAYS,
+    updates: stateOf(acc) === 'paid', latestVersion: LATEST_VERSION, updateUrl: UPDATE_URL,
     devices: devs.map(d => ({ kind: d.kind, model: d.model, lastSeen: d.last_seen, current: d.id === deviceRow })) };
 }
 function readDevice(b) {
@@ -81,16 +100,56 @@ function readDevice(b) {
   if (id.length < 8) throw new HttpErr(400, 'badDevice');
   return { id, kind: b.kind === 'tablet' ? 'tablet' : 'phone', model: String(b.model || '').slice(0, 80) };
 }
-// one phone and one tablet per account
-async function attachDevice(acc, dev) {
+// one device per account. A paid account can move to a new device (transfer=true); the old device is then blocked for good.
+async function attachDevice(acc, dev, transfer) {
+  const [rev] = await q('select 1 from devices where account_id=$1 and device_id=$2 and revoked', [acc.id, dev.id]);
+  if (rev) throw new HttpErr(403, 'deviceRevoked');
   const cur = await q('select * from devices where account_id=$1 and active', [acc.id]);
   const same = cur.find(d => d.device_id === dev.id);
-  if (same) { await q('update devices set last_seen=now(), model=$2 where id=$1', [same.id, dev.model || same.model]); return same.id; }
-  const taken = cur.find(d => d.kind === dev.kind);
-  if (taken) throw new HttpErr(409, 'slotTaken', { kind: dev.kind, model: taken.model, lastSeen: taken.last_seen });
+  if (same) { await q('update devices set last_seen=now(), model=$2, kind=$3 where id=$1', [same.id, dev.model || same.model, dev.kind]); return same.id; }
+  const other = cur[0];
+  if (other) {
+    const info = { model: other.model, kind: other.kind, lastSeen: other.last_seen, canTransfer: !!acc.paid };
+    if (!acc.paid || !transfer) throw new HttpErr(409, 'otherDevice', info);
+    await q('update devices set active=false, revoked=true, revoked_at=now() where account_id=$1 and active', [acc.id]);
+  }
   const [row] = await q('insert into devices(account_id, device_id, kind, model) values($1,$2,$3,$4) returning id', [acc.id, dev.id, dev.kind, dev.model]);
   return row.id;
 }
+// Google / Apple: find the account for this identity, or create it (trial only if the device never had one)
+async function socialAccount(provider, sub, email, name, dev) {
+  const col = provider === 'apple' ? 'apple_sub' : 'google_sub';
+  let [acc] = await q(`select * from accounts where ${col}=$1`, [sub]);
+  if (acc) { if (name && name !== acc.display_name) { await q('update accounts set display_name=$2 where id=$1', [acc.id, String(name).slice(0, 80)]); acc.display_name = name; } return { acc, created: false, usedTrial: false }; }
+  const base = (String(email || provider).split('@')[0].toLowerCase().replace(/[^a-z0-9._-]/g, '') || provider).slice(0, 24).padEnd(3, '0');
+  let username = base;
+  for (let i = 0; i < 50; i++) { const [x] = await q('select 1 from accounts where username=$1', [username]); if (!x) break; username = base + (Math.floor(Math.random() * 9000) + 1000); }
+  const [usedTrial] = await q('select 1 from trial_devices where device_id=$1', [dev.id]);
+  const trialEnds = usedTrial ? new Date() : new Date(Date.now() + TRIAL_DAYS * 864e5);
+  [acc] = await q(`insert into accounts(public_id, username, pass_hash, trial_ends, ${col}, email, display_name) values($1,$2,$3,$4,$5,$6,$7) returning *`,
+    [crypto.randomUUID(), username, provider, trialEnds, sub, email || null, String(name || '').slice(0, 80)]);
+  if (!usedTrial) await q('insert into trial_devices(device_id, account_id) values($1,$2) on conflict do nothing', [dev.id, acc.id]);
+  return { acc, created: true, usedTrial: !!usedTrial };
+}
+// Apple ID token check (RS256 with Apple's published keys)
+let appleKeys = null;
+async function verifyAppleToken(idToken, nonce) {
+  const [h, p, sig] = String(idToken || '').split('.');
+  if (!h || !p || !sig) throw new HttpErr(401, 'badApple');
+  const head = JSON.parse(Buffer.from(h, 'base64url').toString()), claims = JSON.parse(Buffer.from(p, 'base64url').toString());
+  if (!appleKeys || appleKeys.at < Date.now() - 3600e3 || !appleKeys.keys.some(k => k.kid === head.kid)) {
+    const r = await fetch('https://appleid.apple.com/auth/keys').catch(() => { throw new HttpErr(502, 'appleUnreachable'); });
+    appleKeys = { at: Date.now(), keys: (await r.json()).keys || [] };
+  }
+  const jwk = appleKeys.keys.find(k => k.kid === head.kid);
+  if (!jwk || head.alg !== 'RS256') throw new HttpErr(401, 'badApple');
+  const ok = crypto.verify('RSA-SHA256', Buffer.from(h + '.' + p), crypto.createPublicKey({ key: jwk, format: 'jwk' }), Buffer.from(sig, 'base64url'));
+  if (!ok || claims.iss !== 'https://appleid.apple.com' || claims.aud !== APPLE_CLIENT_ID || claims.exp * 1000 < Date.now() || !claims.sub) throw new HttpErr(401, 'badApple');
+  if (nonce && claims.nonce && claims.nonce !== nonce) throw new HttpErr(401, 'badApple');
+  return claims;
+}
+const applePending = new Map();     // state -> { dev, nonce, at, identity }
+setInterval(() => { const old = Date.now() - 15 * 60e3; for (const [k, v] of applePending) if (v.at < old) applePending.delete(k); }, 60000).unref();
 async function newSession(acc, deviceRow) {
   const token = crypto.randomBytes(32).toString('hex');
   await q('insert into sessions(token_hash, account_id, device_row) values($1,$2,$3)', [sha(token), acc.id, deviceRow]);
@@ -139,7 +198,7 @@ async function verifyPlay(token, productId) {
 // ---------- API ----------
 const routes = {
   'GET /health': async () => ({ ok: true, db: dbReady }),
-  'GET /api/config': async () => ({ ok: true, productId: PRODUCT_ID, trialDays: TRIAL_DAYS, googleClientId: GOOGLE_CLIENT_ID }),
+  'GET /api/config': async () => ({ ok: true, productId: PRODUCT_ID, trialDays: TRIAL_DAYS, googleClientId: GOOGLE_CLIENT_ID, apple: !!APPLE_CLIENT_ID, support: SUPPORT_EMAIL, ai: !!AI_KEY, latestVersion: LATEST_VERSION, updateUrl: UPDATE_URL }),
 
   // Sign in with Google: the app sends the Google ID token; Google confirms it; first sign-in creates the account
   'POST /api/google': async (req, b) => {
@@ -149,22 +208,98 @@ const routes = {
     const g = await r.json().catch(() => ({}));
     if (!r.ok || g.aud !== GOOGLE_CLIENT_ID || !/^(https:\/\/)?accounts\.google\.com$/.test(g.iss || '') || +g.exp * 1000 < Date.now() || !g.sub) throw new HttpErr(401, 'badGoogle');
     const dev = readDevice(b);
-    let [acc] = await q('select * from accounts where google_sub=$1', [g.sub]);
-    let created = false, usedTrial = null;
-    if (!acc) {
-      const base = (String(g.email || 'user').split('@')[0].toLowerCase().replace(/[^a-z0-9._-]/g, '') || 'user').slice(0, 24).padEnd(3, '0');
-      let username = base;
-      for (let i = 0; i < 50; i++) { const [x] = await q('select 1 from accounts where username=$1', [username]); if (!x) break; username = base + (Math.floor(Math.random() * 9000) + 1000); }
-      [usedTrial] = await q('select 1 from trial_devices where device_id=$1', [dev.id]);
-      const trialEnds = usedTrial ? new Date() : new Date(Date.now() + TRIAL_DAYS * 864e5);
-      [acc] = await q(`insert into accounts(public_id, username, pass_hash, trial_ends, google_sub, email, display_name) values($1,$2,$3,$4,$5,$6,$7) returning *`,
-        [crypto.randomUUID(), username, 'google', trialEnds, g.sub, g.email_verified === 'true' || g.email_verified === true ? g.email : null, String(g.name || b.name || '').slice(0, 80)]);
-      if (!usedTrial) await q('insert into trial_devices(device_id, account_id) values($1,$2) on conflict do nothing', [dev.id, acc.id]);
-      created = true;
-    } else if (g.name && g.name !== acc.display_name) { await q('update accounts set display_name=$2 where id=$1', [acc.id, String(g.name).slice(0, 80)]); acc.display_name = g.name; }
-    const row = await attachDevice(acc, dev);
-    return { ...(await statusPayload(acc, row)), token: await newSession(acc, row), created, trialUsedOnDevice: !!usedTrial };
+    const { acc, created, usedTrial } = await socialAccount('google', g.sub, g.email_verified === 'true' || g.email_verified === true ? g.email : null, g.name || b.name || '', dev);
+    const row = await attachDevice(acc, dev, !!b.transfer);
+    return { ...(await statusPayload(acc, row)), token: await newSession(acc, row), created, trialUsedOnDevice: usedTrial };
   },
+
+  // Sign in with Apple (works on Android through Apple's web page): start -> Apple -> callback -> app deep link -> finish
+  'POST /api/apple/start': async (req, b) => {
+    limit('apple:' + req.ip, 30, 600e3);
+    if (!APPLE_CLIENT_ID) throw new HttpErr(503, 'appleNotConfigured');
+    const dev = readDevice(b), state = crypto.randomBytes(16).toString('hex'), nonce = crypto.randomBytes(16).toString('hex');
+    applePending.set(state, { dev, nonce, at: Date.now() });
+    const u = new URL('https://appleid.apple.com/auth/authorize');
+    u.search = new URLSearchParams({ client_id: APPLE_CLIENT_ID, redirect_uri: PUBLIC_URL + '/auth/apple/callback', response_type: 'code id_token', response_mode: 'form_post', scope: 'name email', state, nonce }).toString();
+    return { ok: true, url: u.toString(), state };
+  },
+  'POST /auth/apple/callback': async (req, b) => {
+    const p = applePending.get(String(b.state || ''));
+    let ok = false;
+    if (p) { try { const c = await verifyAppleToken(b.id_token, p.nonce); let name = '';
+        try { const u = JSON.parse(b.user || '{}'); name = [u.name && u.name.firstName, u.name && u.name.lastName].filter(Boolean).join(' '); } catch (e) {}
+        p.identity = { sub: c.sub, email: c.email || null, name }; ok = true; } catch (e) { p.error = e.code || 'badApple'; } }
+    const link = 'tashtibati://auth?provider=apple&state=' + encodeURIComponent(String(b.state || ''));
+    return { __html: page('Tashtibati', `<div class="card" style="text-align:center"><h1>${ok ? 'تم تسجيل الدخول بحساب Apple' : 'تعذر تسجيل الدخول بحساب Apple'}</h1>
+      <p><a href="${link}"><button>العودة إلى تطبيق تشطيباتى</button></a></p><p class="muted">${ok ? 'Signed in with Apple — return to the app.' : 'Apple sign-in failed — return to the app and try again.'}</p></div>
+      <script>setTimeout(function(){location.href=${JSON.stringify(link)}},300)</script>`) };
+  },
+  'POST /api/apple/finish': async (req, b) => {
+    const p = applePending.get(String(b.state || ''));
+    if (!p) throw new HttpErr(410, 'appleExpired');
+    if (p.error) throw new HttpErr(401, p.error);
+    if (!p.identity) throw new HttpErr(409, 'appleNotDone');
+    const { acc, created, usedTrial } = await socialAccount('apple', p.identity.sub, p.identity.email, p.identity.name, p.dev);
+    const row = await attachDevice(acc, p.dev, !!b.transfer);
+    applePending.delete(String(b.state));
+    return { ...(await statusPayload(acc, row)), token: await newSession(acc, row), created, trialUsedOnDevice: usedTrial };
+  },
+
+  // ---------- help and support ----------
+  'GET /api/help': async () => ({ ok: true, articles: HELP, email: SUPPORT_EMAIL }),
+  'POST /api/support': async (req, b) => {
+    limit('ai:' + req.ip, 40, 3600e3);
+    let who = null; try { who = await auth(req); } catch (e) {}
+    const lang = b.lang === 'en' ? 'en' : 'ar';
+    const msgs = (Array.isArray(b.messages) ? b.messages : []).slice(-12).map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content || '').slice(0, 2000) })).filter(m => m.content);
+    while (msgs.length && msgs[0].role !== 'user') msgs.shift();
+    if (!msgs.length) throw new HttpErr(400, 'empty');
+    const last = msgs[msgs.length - 1].content;
+    if (AI_KEY) {
+      const kb = HELP.map(a => `## ${a.en.t} / ${a.ar.t}\n${a.en.b}\n${a.ar.b}`).join('\n\n');
+      const acct = who ? `The user is signed in as "${who.username}"; account state: ${stateOf(who)}${stateOf(who) === 'trial' ? ' (trial ends ' + new Date(who.trial_ends).toISOString().slice(0, 10) + ')' : ''}.` : 'The user is not signed in.';
+      const system = `You are the customer-support assistant inside the Tashtibati (تشطيباتى) Android app, used by finishing/fit-out site engineers in Egypt to track project accounts, WhatsApp groups, agreements, files and Excel reports.
+Answer only questions about using this app, using the help articles below as the source of truth. Never invent features, prices or policies. Never ask for passwords or payment details.
+Reply in ${lang === 'ar' ? 'Arabic (clear, simple Modern Standard Arabic that Egyptians use)' : 'English'} unless the user writes in the other language. Keep answers short (under 120 words), with numbered steps when useful.
+${acct}
+If the problem needs a person — payment or refund problems, an account the user cannot get into, a forgotten password, a blocked or lost device, lost data, a crash or bug, anything the articles do not cover, or the user asks for a human — say that you will pass it to the support team at ${SUPPORT_EMAIL}, and end your reply with the exact token [[ESCALATE]].
+
+Help articles:
+${kb}`;
+      try {
+        const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': AI_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+          body: JSON.stringify({ model: AI_MODEL, max_tokens: 700, system, messages: msgs }) });
+        const j = await r.json();
+        if (r.ok) { let text = (j.content || []).filter(c => c.type === 'text').map(c => c.text).join('').trim();
+          const escalate = text.includes('[[ESCALATE]]'); text = text.replace(/\[\[ESCALATE\]\]/g, '').trim();
+          return { ok: true, reply: text, escalate, ai: true }; }
+        console.error('support ai', r.status, j.error && j.error.message);
+      } catch (e) { console.error('support ai', e.message); }
+    }
+    // no assistant configured (or it failed): answer from the closest help article
+    const words = s2 => String(s2).toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter(w => w.length > 2);
+    const want = new Set(words(last)); let best = null, score = 0;
+    for (const a of HELP) { const t = words(a[lang].t + ' ' + a[lang].b + ' ' + a.en.t + ' ' + a.ar.t); const sc = t.filter(w => want.has(w)).length; if (sc > score) { score = sc; best = a; } }
+    const reply = best && score >= 1 ? `${best[lang].t}\n${best[lang].b}` : (lang === 'ar' ? 'لم أجد إجابة مناسبة في المساعدة. يمكنك إرسال المشكلة لفريق الدعم.' : 'I could not find an answer in the help. You can send this to the support team.');
+    return { ok: true, reply, escalate: !best || score < 2, ai: false };
+  },
+  'POST /api/support/ticket': async (req, b) => {
+    limit('ticket:' + req.ip, 10, 3600e3);
+    let who = null; try { who = await auth(req); } catch (e) {}
+    const [t] = await q(`insert into support_tickets(account_id, username, contact, subject, message, transcript, lang, device) values($1,$2,$3,$4,$5,$6,$7,$8) returning id`,
+      [who ? who.id : null, who ? who.username : String(b.username || '').slice(0, 64), String(b.contact || '').slice(0, 120), String(b.subject || '').slice(0, 200), String(b.message || '').slice(0, 4000),
+       JSON.stringify((Array.isArray(b.transcript) ? b.transcript : []).slice(-20)), b.lang === 'en' ? 'en' : 'ar', String(b.device || '').slice(0, 120)]);
+    return { ok: true, id: t.id, email: SUPPORT_EMAIL };
+  },
+
+  // moving to a new device from the old one: this device is removed and blocked for this account (full version only)
+  'POST /api/release-device': async (req) => {
+    const s = await auth(req);
+    if (!s.paid) throw new HttpErr(403, 'transferNeedsPurchase');
+    if (s.device_row) await q('update devices set active=false, revoked=true, revoked_at=now() where id=$1', [s.device_row]);
+    return { ok: true };
+  },
+
 
   'POST /api/register': async (req, b) => {
     limit('reg:' + req.ip, 10, 3600e3);
@@ -178,7 +313,7 @@ const routes = {
     const trialEnds = usedTrial ? new Date() : new Date(Date.now() + TRIAL_DAYS * 864e5);
     const [acc] = await q('insert into accounts(public_id, username, pass_hash, trial_ends) values($1,$2,$3,$4) returning *', [crypto.randomUUID(), username, hashPassword(pw), trialEnds]);
     if (!usedTrial) await q('insert into trial_devices(device_id, account_id) values($1,$2) on conflict do nothing', [dev.id, acc.id]);
-    const row = await attachDevice(acc, dev);
+    const row = await attachDevice(acc, dev, false);
     return { ...(await statusPayload(acc, row)), token: await newSession(acc, row), trialUsedOnDevice: !!usedTrial };
   },
 
@@ -187,7 +322,7 @@ const routes = {
     limit('login:' + req.ip, 30, 600e3); limit('user:' + username, 10, 900e3);
     const [acc] = await q('select * from accounts where username=$1', [username]);
     if (!acc || !checkPassword(String(b.password || ''), acc.pass_hash)) throw new HttpErr(401, 'badLogin');
-    const row = await attachDevice(acc, readDevice(b));
+    const row = await attachDevice(acc, readDevice(b), !!b.transfer);
     hits.delete('user:' + username);
     return { ...(await statusPayload(acc, row)), token: await newSession(acc, row) };
   },
@@ -217,7 +352,6 @@ const routes = {
 
   'POST /api/logout': async (req) => {
     const s = await auth(req);
-    if (s.device_row) await q('update devices set active=false where id=$1', [s.device_row]);
     await q('delete from sessions where token_hash=$1', [s.token_hash]);
     return { ok: true };
   },
@@ -233,7 +367,7 @@ const routes = {
 
   'POST /api/delete-account': async (req, b) => {
     const s = await auth(req);
-    const ok = s.google_sub && s.pass_hash === 'google' ? normUser(b.confirm) === s.username : checkPassword(String(b.password || ''), s.pass_hash);
+    const ok = ['google', 'apple'].includes(s.pass_hash) ? normUser(b.confirm) === s.username : checkPassword(String(b.password || ''), s.pass_hash);
     if (!ok) throw new HttpErr(401, 'badLogin');
     await q('delete from accounts where id=$1', [s.id]);
     return { ok: true };
@@ -245,6 +379,7 @@ const routes = {
     const term = '%' + (url.searchParams.get('q') || '').toLowerCase() + '%';
     const rows = await q(`select a.id, a.username, a.email, a.google_sub is not null as google, a.created_at, a.trial_ends, a.paid, a.paid_at, a.paid_via, a.note,
         (select json_agg(json_build_object('id', d.id, 'kind', d.kind, 'model', d.model, 'lastSeen', d.last_seen)) from devices d where d.account_id=a.id and d.active) as devices,
+        (select count(*)::int from devices d where d.account_id=a.id and d.revoked) as blocked, a.apple_sub is not null as apple,
         (select json_agg(json_build_object('order', p.order_id, 'state', p.state, 'at', p.created_at)) from purchases p where p.account_id=a.id) as purchases
       from accounts a where a.username like $1 order by a.created_at desc limit 300`, [term]);
     const [tot] = await q(`select count(*)::int as all, count(*) filter (where paid)::int as paid, count(*) filter (where not paid and trial_ends>now())::int as trial from accounts`);
@@ -258,11 +393,15 @@ const routes = {
     else if (b.action === 'extendTrial') await q(`update accounts set trial_ends=greatest(trial_ends, now()) + ($2 || ' days')::interval where id=$1`, [id, String(Math.min(365, Math.max(1, +b.days || 7)))]);
     else if (b.action === 'resetDevices') { await q('update devices set active=false where account_id=$1', [id]); await q('delete from sessions where account_id=$1', [id]); }
     else if (b.action === 'removeDevice') { await q('update devices set active=false where id=$1 and account_id=$2', [+b.deviceId, id]); await q('delete from sessions where device_row=$1', [+b.deviceId]); }
+    else if (b.action === 'unblockDevices') await q('update devices set revoked=false where account_id=$1 and revoked', [id]);
     else if (b.action === 'note') await q('update accounts set note=$2 where id=$1', [id, String(b.note || '').slice(0, 500)]);
     else if (b.action === 'delete') await q('delete from accounts where id=$1', [id]);
     else throw new HttpErr(400, 'badAction');
     return { ok: true };
   },
+  'GET /admin/api/tickets': async (req) => { adminAuth(req);
+    return { ok: true, tickets: await q(`select id, username, contact, subject, message, transcript, lang, device, status, created_at from support_tickets order by (status='open') desc, created_at desc limit 200`) }; },
+  'POST /admin/api/ticket': async (req, b) => { adminAuth(req); await q('update support_tickets set status=$2 where id=$1', [+b.id, b.status === 'open' ? 'open' : 'closed']); return { ok: true }; },
   'POST /delete-account': async (req, b) => {         // web form for Google Play's account-deletion requirement
     limit('del:' + req.ip, 10, 3600e3);
     const [acc] = await q('select * from accounts where username=$1', [normUser(b.username)]);
@@ -287,15 +426,19 @@ table{width:100%;border-collapse:collapse;font-size:14px}td,th{padding:8px;borde
 .paid{background:#dcf0e4;color:#1f7a4d}.trial{background:#dfe8f5;color:#1f4e8c}.expired{background:#f6e1dd;color:#a3301f}.muted{color:#5d6862}
 @media (prefers-color-scheme:dark){body{background:#111614;color:#e6ebe7}.card{background:#19201d;border-color:#2b3531}td,th{border-color:#2b3531}button.ghost{background:#19201d;color:#e6ebe7}.muted{color:#9aa59f}}</style></head><body><main>${body}</main></body></html>`;
 
-const PRIVACY = page('سياسة الخصوصية — تشطيباتى', `<h1>سياسة الخصوصية — تشطيباتى</h1>
-<p>تطبيق تشطيباتى يساعد مهندسي التشطيبات على تسجيل حسابات المشاريع. هذه الصفحة تشرح البيانات التي نتعامل معها.</p>
-<h2>بيانات الحساب على خادمنا</h2><p>اسم المستخدم، وكلمة المرور مخزنة بشكل مشفّر (لا يمكن قراءتها)، وتاريخ بدء الفترة التجريبية، وحالة الشراء من Google Play (رقم الطلب ورمز الشراء)، ومعرّف الجهاز ونوعه (هاتف أو تابلت) وطرازه، لتطبيق حد الجهازين لكل حساب.</p>
-<h2>بيانات المشاريع</h2><p>بيانات المشاريع (الحسابات والاتفاقات والملفات) تُحفظ على جهازك، وإذا فعّلت المزامنة تُحفظ في مجلد «Tashtibati» داخل Google Drive الخاص بك. لا تُرسل بيانات المشاريع إلى خادمنا.</p>
+const PRIVACY = page('سياسة الخصوصية وشروط الاستخدام — تشطيباتى', `<h1>سياسة الخصوصية — تشطيباتى</h1>
+<p>تطبيق تشطيباتى يساعد مهندسي التشطيبات على تسجيل حسابات المشاريع. هذه الصفحة تشرح البيانات التي نتعامل معها وشروط الاستخدام.</p>
+<h2>بيانات الحساب على خادمنا</h2><p>اسم المستخدم، وكلمة المرور مخزنة بشكل مشفّر (لا يمكن قراءتها)، أو معرّف حساب Google أو Apple وبريده واسمه عند الدخول بهما، وتاريخ الفترة التجريبية، وحالة الشراء من Google Play (رقم الطلب ورمز الشراء)، ومعرّف الجهاز ونوعه وطرازه لتطبيق قاعدة الجهاز الواحد لكل حساب ومنع تكرار الفترة التجريبية على نفس الجهاز.</p>
+<h2>بيانات المشاريع والنسخ الاحتياطي</h2><p>بيانات المشاريع (الحسابات والاتفاقات والملفات) تُحفظ على جهازك. النسخ الاحتياطي يكون حسب اختيارك: في مجلد «Tashtibati» داخل Google Drive الخاص بك، أو ملف على جهازك ترسله لأي سحابة، أو iCloud في نسخة الآيفون. لا تُرسل بيانات المشاريع إلى خادمنا.</p>
 <h2>واتساب والموقع</h2><p>قراءة إشعارات واتساب (عند تفعيلها بموافقتك) تتم على جهازك فقط، ويُحفظ منها رسائل التحويلات ورسائل جروب فريق العمل الذي تختاره. موقع المشروع يُحفظ على جهازك عند طلبك.</p>
-<h2>حذف الحساب</h2><p>يمكنك حذف حسابك من داخل التطبيق (الحساب ← حذف الحساب) أو من <a href="/delete-account">صفحة حذف الحساب</a>. يُحذف الحساب وبيانات الأجهزة والجلسات فورًا. بيانات مشاريعك على جهازك وفي Google Drive تبقى ملكك وتحت تحكمك.</p>
+<h2>المساعدة والدعم</h2><p>أسئلتك للمساعد الذكي داخل التطبيق تُرسل إلى خادمنا ومزوّد الذكاء الاصطناعي (Anthropic) لتوليد الرد فقط، ولا تُستخدم لأي غرض آخر. الطلبات المحوّلة للدعم تُحفظ لدينا مع اسم المستخدم لمتابعتها، وتُرسل بالبريد إلى ${SUPPORT_EMAIL}.</p>
+<h2>الشراء والتحديثات</h2><p>النسخة الكاملة شراء لمرة واحدة عبر Google Play، وتشمل حق تنزيل التطبيق وجميع تحديثاته المستقبلية لنفس الحساب، وإعادة تثبيته على جهازك. الحساب يعمل على جهاز واحد، ويمكن نقله لجهاز جديد بعد الشراء، وعندها يُزال الجهاز القديم ولا يمكنه الدخول لهذا الحساب مرة أخرى. الفترة التجريبية مرة واحدة لكل جهاز.</p>
+<h2>حذف الحساب</h2><p>يمكنك حذف حسابك من داخل التطبيق (الحساب ← حذف الحساب) أو من <a href="/delete-account">صفحة حذف الحساب</a>. يُحذف الحساب وبيانات الأجهزة والجلسات فورًا. بيانات مشاريعك على جهازك ونسخك الاحتياطية تبقى ملكك وتحت تحكمك.</p>
 <h2>التواصل</h2><p>${CONTACT}</p>
-<hr><h1 dir="ltr" style="text-align:left">Privacy policy — Tashtibati</h1><div dir="ltr" style="text-align:left">
-<p>Our server stores your username, a hashed password, trial dates, Google Play purchase details, and the id, type and model of up to two devices (one phone, one tablet). Project data stays on your device and, if you turn on sync, in a "Tashtibati" folder in your own Google Drive; it is never sent to our server. WhatsApp notification reading (only with your consent) happens on the device. You can delete your account in the app or at <a href="/delete-account">/delete-account</a>. Contact: ${CONTACT}</p></div>`);
+<hr><h1 dir="ltr" style="text-align:left">Privacy policy and terms — Tashtibati</h1><div dir="ltr" style="text-align:left">
+<p>Our server stores your username and a hashed password (or your Google / Apple account id, email and name when you sign in with them), trial dates, Google Play purchase details, and the id, type and model of your device, to apply the one-device-per-account rule and to give each device only one free trial. Project data stays on your device; backups go where you choose: a "Tashtibati" folder in your own Google Drive, a file on your device that you can send to any cloud, or iCloud on the iPhone version. Project data is never sent to our server. WhatsApp notification reading (only with your consent) happens on the device.</p>
+<p>Questions to the in-app support assistant are sent to our server and our AI provider (Anthropic) only to produce the reply. Issues passed to support are stored with your username and emailed to ${SUPPORT_EMAIL}.</p>
+<p>The full version is a one-time Google Play purchase and includes the right to download the app and all its future updates on the same account, and to reinstall it on your device. An account works on one device; after purchase it can be moved to a new device, and the old device is then removed and cannot sign in to that account again. You can delete your account in the app or at <a href="/delete-account">/delete-account</a>. Contact: ${CONTACT}</p></div>`);
 
 const DELETE_PAGE = page('حذف الحساب — تشطيباتى', `<h1>حذف حساب تشطيباتى</h1><p class="muted">يحذف الحساب وحالة الشراء والأجهزة المسجلة نهائيًا. بيانات المشاريع على جهازك وفي Google Drive لا تتأثر.</p>
 <form class="card" id="f"><p><label>اسم المستخدم<br><input name="username" autocomplete="username" required></label></p><p><label>كلمة المرور<br><input name="password" type="password" autocomplete="current-password" required></label></p>
@@ -305,24 +448,28 @@ const DELETE_PAGE = page('حذف الحساب — تشطيباتى', `<h1>حذف
 const ADMIN_PAGE = page('إدارة تشطيباتى', `<h1>إدارة حسابات تشطيباتى</h1>
 <div class="card" id="tot">…</div>
 <div class="card" style="display:flex;gap:8px;flex-wrap:wrap"><input id="q" placeholder="بحث باسم المستخدم" style="flex:1;min-width:180px"><button id="go">بحث</button></div>
-<div class="card wrap"><table><thead><tr><th>المستخدم</th><th>الحالة</th><th>الأجهزة</th><th>الشراء</th><th>إجراءات</th></tr></thead><tbody id="rows"></tbody></table></div>
+<h2>طلبات الدعم</h2><div class="card wrap" id="tickets">…</div>
+<h2>الحسابات</h2><div class="card wrap"><table><thead><tr><th>المستخدم</th><th>الحالة</th><th>الأجهزة</th><th>الشراء</th><th>إجراءات</th></tr></thead><tbody id="rows"></tbody></table></div>
 <script>
 const $=s=>document.querySelector(s);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const d=x=>x?new Date(x).toLocaleString('ar-EG-u-nu-latn',{dateStyle:'medium',timeStyle:'short'}):'—';
 const st={paid:'مدفوع',trial:'تجريبي',expired:'انتهت التجربة'};
 async function load(){const r=await fetch('/admin/api/accounts?q='+encodeURIComponent($('#q').value));const j=await r.json();
  $('#tot').innerHTML='الحسابات: <b>'+j.totals.all+'</b> · مدفوع: <b>'+j.totals.paid+'</b> · في التجربة: <b>'+j.totals.trial+'</b>';
- $('#rows').innerHTML=j.accounts.map(a=>'<tr><td><b>'+esc(a.username)+'</b>'+(a.google?' <span class="pill trial">Google</span>':'')+(a.email?'<br><span class="muted">'+esc(a.email)+'</span>':'')+'<br><span class="muted">'+d(a.created_at)+'</span>'+(a.note?'<br><span class="muted">'+esc(a.note)+'</span>':'')+'</td>'+
+ $('#rows').innerHTML=j.accounts.map(a=>'<tr><td><b>'+esc(a.username)+'</b>'+(a.google?' <span class="pill trial">Google</span>':'')+(a.apple?' <span class="pill trial">Apple</span>':'')+(a.email?'<br><span class="muted">'+esc(a.email)+'</span>':'')+'<br><span class="muted">'+d(a.created_at)+'</span>'+(a.note?'<br><span class="muted">'+esc(a.note)+'</span>':'')+'</td>'+
  '<td><span class="pill '+a.state+'">'+st[a.state]+'</span><br><span class="muted">'+(a.paid?('منذ '+d(a.paid_at)+' · '+esc(a.paid_via||'')):('حتى '+d(a.trial_ends)))+'</span></td>'+
  '<td>'+((a.devices||[]).map(x=>esc(x.kind==='tablet'?'تابلت':'هاتف')+' '+esc(x.model)+' <button class="ghost" data-a="removeDevice" data-id="'+a.id+'" data-dev="'+x.id+'">إزالة</button><br><span class="muted">'+d(x.lastSeen)+'</span>').join('<br>')||'—')+'</td>'+
  '<td>'+((a.purchases||[]).map(p=>esc(p.order||'')+' <b>'+esc(p.state)+'</b>').join('<br>')||'—')+'</td>'+
  '<td style="display:flex;gap:6px;flex-wrap:wrap">'+(a.paid?'<button class="ghost" data-a="markUnpaid" data-id="'+a.id+'">إلغاء التفعيل</button>':'<button data-a="markPaid" data-id="'+a.id+'">تفعيل كمدفوع</button>')+
- '<button class="ghost" data-a="extendTrial" data-id="'+a.id+'">+7 أيام</button><button class="ghost" data-a="resetDevices" data-id="'+a.id+'">إعادة ضبط الأجهزة</button><button class="ghost" data-a="note" data-id="'+a.id+'">ملاحظة</button></td></tr>').join('');}
+ (a.blocked?'<button class="ghost" data-a="unblockDevices" data-id="'+a.id+'">إلغاء حظر '+a.blocked+' جهاز قديم</button>':'')+'<button class="ghost" data-a="extendTrial" data-id="'+a.id+'">+7 أيام</button><button class="ghost" data-a="resetDevices" data-id="'+a.id+'">إعادة ضبط الأجهزة</button><button class="ghost" data-a="note" data-id="'+a.id+'">ملاحظة</button></td></tr>').join('');}
 document.addEventListener('click',async e=>{const b=e.target.closest('[data-a]');if(!b)return;const body={id:+b.dataset.id,action:b.dataset.a,deviceId:+b.dataset.dev||undefined,days:7};
  if(body.action==='note'){const n=prompt('ملاحظة');if(n==null)return;body.note=n;}
- if(['resetDevices','markUnpaid','removeDevice'].includes(body.action)&&!confirm('تأكيد؟'))return;
+ if(['resetDevices','markUnpaid','removeDevice','unblockDevices'].includes(body.action)&&!confirm('تأكيد؟'))return;
  await fetch('/admin/api/account',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});load();});
-$('#go').onclick=load;$('#q').onkeydown=e=>{if(e.key==='Enter')load();};load();
+async function loadT(){const j=await (await fetch('/admin/api/tickets')).json();
+ $('#tickets').innerHTML=j.tickets.length?'<table><thead><tr><th>#</th><th>المستخدم</th><th>المشكلة</th><th>الحالة</th></tr></thead><tbody>'+j.tickets.map(t=>'<tr><td>'+t.id+'<br><span class="muted">'+d(t.created_at)+'</span></td><td>'+esc(t.username||'—')+'<br><span class="muted">'+esc(t.contact||'')+' '+esc(t.device||'')+'</span></td><td><b>'+esc(t.subject||'')+'</b><br><span style="white-space:pre-wrap">'+esc(t.message||'')+'</span>'+((t.transcript||[]).length?'<details><summary class="muted">المحادثة</summary>'+(t.transcript||[]).map(m=>'<p><b>'+(m.role==='assistant'?'المساعد':'المستخدم')+':</b> '+esc(m.content)+'</p>').join('')+'</details>':'')+'</td><td><span class="pill '+(t.status==='open'?'expired':'paid')+'">'+(t.status==='open'?'مفتوح':'مغلق')+'</span><br><button class="ghost" data-t="'+t.id+'" data-s="'+(t.status==='open'?'closed':'open')+'">'+(t.status==='open'?'إغلاق':'إعادة فتح')+'</button></td></tr>').join('')+'</tbody></table>':'<p class="muted">لا توجد طلبات.</p>';}
+document.addEventListener('click',async e=>{const b=e.target.closest('[data-t]');if(!b)return;await fetch('/admin/api/ticket',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id:+b.dataset.t,status:b.dataset.s})});loadT();});
+loadT();$('#go').onclick=load;$('#q').onkeydown=e=>{if(e.key==='Enter')load();};load();
 </script>`);
 
 // ---------- server ----------
@@ -345,9 +492,12 @@ const server = http.createServer(async (req, res) => {
     let body = {};
     if (req.method === 'POST') {
       let raw = ''; for await (const c of req) { raw += c; if (raw.length > 65536) throw new HttpErr(413, 'tooLarge'); }
-      try { body = raw ? JSON.parse(raw) : {}; } catch (e) { throw new HttpErr(400, 'badJson'); }
+      if (/application\/x-www-form-urlencoded/.test(req.headers['content-type'] || '')) body = Object.fromEntries(new URLSearchParams(raw));
+      else { try { body = raw ? JSON.parse(raw) : {}; } catch (e) { throw new HttpErr(400, 'badJson'); } }
     }
-    send(res, 200, await h(req, body, url));
+    const out = await h(req, body, url);
+    if (out && out.__html) return send(res, 200, out.__html, 'text/html; charset=utf-8');
+    send(res, 200, out);
   } catch (e) {
     if (e instanceof HttpErr) return send(res, e.status, { ok: false, error: e.code, ...e.extra }, 'application/json; charset=utf-8', e.extra.basic ? { 'www-authenticate': 'Basic realm="Tashtibati admin", charset="UTF-8"' } : {});
     console.error(e); send(res, 500, { ok: false, error: 'server' });
