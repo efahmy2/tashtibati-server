@@ -515,6 +515,7 @@ function send(res, status, body, type = 'application/json; charset=utf-8', extra
 }
 const server = http.createServer(async (req, res) => {
   req.ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+  if (ipDiag < 40 && /^\/(api\/config|health)/.test(req.url)) { ipDiag++; console.log('ipdiag', JSON.stringify({ xff: req.headers['x-forwarded-for'], tci: req.headers['true-client-ip'], cf: req.headers['cf-connecting-ip'], xr: req.headers['x-real-ip'], remote: req.socket.remoteAddress, url: req.url })); }
   const url = new URL(req.url, 'http://x');
   if (req.method === 'OPTIONS') return send(res, 204, '');
   try {
@@ -541,6 +542,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 let dbReady = false;
+let ipDiag = 0;
 // optional: SEED_USER / SEED_PASSWORD create (or reset) one activated account at start-up, for testing
 async function seedTestUser() {
   const u = normUser(process.env.SEED_USER || ''), pw = process.env.SEED_PASSWORD || '';
