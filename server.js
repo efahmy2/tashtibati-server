@@ -19,6 +19,7 @@ const APPLE_CLIENT_ID = process.env.APPLE_CLIENT_ID || '';     // Apple "Service
 const PUBLIC_URL = (process.env.PUBLIC_URL || 'https://tashtibati.onrender.com').replace(/\/$/, '');
 const AI_KEY = process.env.ANTHROPIC_API_KEY || '';
 const AI_MODEL = process.env.SUPPORT_MODEL || 'claude-haiku-5-5';
+const PLAN_MODEL = process.env.PLAN_MODEL || 'claude-sonnet-5-5';     // reads room names and sizes from plan photos
 const HELP = require('./help.js');
 const LATEST_VERSION = process.env.LATEST_VERSION || '';           // newest app version, e.g. 2.2.0
 const UPDATE_URL = process.env.UPDATE_URL || 'https://play.google.com/store/apps/details?id=' + (process.env.PACKAGE_NAME || 'com.efahmy.finishingprojects');
@@ -299,6 +300,33 @@ ${kb}`;
     return { ok: true, id: t.id, email: SUPPORT_EMAIL };
   },
 
+  // read room names and sizes from a photo of a unit plan (AI vision); the app shows the result for review
+  'POST /api/plan-read': async (req, b) => {
+    const s = await auth(req);
+    if (stateOf(s) === 'expired') throw new HttpErr(403, 'expired');
+    limit('plan:' + s.id, 40, 864e5);
+    if (!AI_KEY) throw new HttpErr(503, 'aiNotConfigured');
+    const data = String(b.image || ''), media = /^image\/(png|webp|gif)$/.test(b.mediaType) ? b.mediaType : 'image/jpeg';
+    if (data.length < 200 || !/^[A-Za-z0-9+/=]+$/.test(data.slice(0, 200))) throw new HttpErr(400, 'badImage');
+    const types = 'bedroom, master, reception, living, dining, kitchen, bathroom, toilet, dressing, corridor, stairs, entrance, balcony, terrace, maid, laundry, storage, office, shop, hall, warehouse, production, parking, loading, yard, garden, pool, roof, other';
+    const prompt = `This image is an architectural floor plan (a brochure page, a drawing, or a photo of one). Read it and return ONLY a JSON object, no other text:
+{"floor": "ground|first|second|third|fourth|fifth|roof|basement|mezzanine|null", "floorLabel": "heading as written or null", "floorArea": number or null, "totalArea": number or null,
+ "spaces": [{"name": "label exactly as written", "nameAr": "Arabic name for it", "type": "one of: ${types}", "length": number or null, "width": number or null, "area": number or null}]}
+Rules: sizes are in metres; a label like "3.70m x 5.88m" means length 3.70 and width 5.88 (keep that order). "floorArea" is the floor's own area if written (e.g. "GROUND FLOOR AREA 107 M2"); "totalArea" is a total built-up area if written.
+Include every labelled room or space. Only give numbers you can actually read — never estimate from the drawing scale; use null when a size is not written or not legible.`;
+    const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': AI_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: PLAN_MODEL, max_tokens: 3000, messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: media, data } }, { type: 'text', text: prompt }] }] }) })
+      .catch(() => { throw new HttpErr(502, 'aiUnreachable'); });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { console.error('plan ai', r.status, j.error && j.error.message); throw new HttpErr(502, 'aiFailed'); }
+    const text = (j.content || []).filter(c => c.type === 'text').map(c => c.text).join('');
+    let plan = null; try { plan = JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1)); } catch (e) {}
+    if (!plan || !Array.isArray(plan.spaces)) throw new HttpErr(422, 'planUnreadable');
+    const n = v => (typeof v === 'number' && isFinite(v) && v > 0 && v < 100000 ? Math.round(v * 100) / 100 : null);
+    plan.spaces = plan.spaces.slice(0, 120).map(x => ({ name: String(x.name || '').slice(0, 60), nameAr: String(x.nameAr || '').slice(0, 60), type: String(x.type || 'other').slice(0, 20), length: n(x.length), width: n(x.width), area: n(x.area) }));
+    return { ok: true, plan: { floor: plan.floor || null, floorLabel: plan.floorLabel || null, floorArea: n(plan.floorArea), totalArea: n(plan.totalArea), spaces: plan.spaces } };
+  },
+
   // moving to a new device from the old one: this device is removed and blocked for this account (full version only)
   'POST /api/release-device': async (req) => {
     const s = await auth(req);
@@ -498,7 +526,8 @@ const server = http.createServer(async (req, res) => {
     if (!h) return send(res, 404, { ok: false, error: 'notFound' });
     let body = {};
     if (req.method === 'POST') {
-      let raw = ''; for await (const c of req) { raw += c; if (raw.length > 65536) throw new HttpErr(413, 'tooLarge'); }
+      const max = url.pathname === '/api/plan-read' ? 9e6 : 65536;
+      let raw = ''; for await (const c of req) { raw += c; if (raw.length > max) throw new HttpErr(413, 'tooLarge'); }
       if (/application\/x-www-form-urlencoded/.test(req.headers['content-type'] || '')) body = Object.fromEntries(new URLSearchParams(raw));
       else { try { body = raw ? JSON.parse(raw) : {}; } catch (e) { throw new HttpErr(400, 'badJson'); } }
     }
