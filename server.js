@@ -40,6 +40,10 @@ const MAIL_FROM = process.env.MAIL_FROM || (process.env.SMTP_USER ? `Tashtibati 
 // SMS / WhatsApp codes: Twilio Verify
 const TW = { sid: process.env.TWILIO_ACCOUNT_SID || '', tok: process.env.TWILIO_AUTH_TOKEN || '', svc: process.env.TWILIO_VERIFY_SID || '' };
 const WA_ON = process.env.TWILIO_WHATSAPP === '1';
+// iPhone / iPad app: App Store purchases are signed by Apple (JWS with an x5c chain up to Apple Root CA - G3, pinned below)
+const IOS_BUNDLE_ID = process.env.IOS_BUNDLE_ID || 'com.efahmy.finishingprojects';
+const IOS_UPDATE_URL = process.env.IOS_UPDATE_URL || '';
+const APPLE_ROOT_FP = (process.env.APPLE_ROOT_FP || '63343abfb89a6a03ebb57e9b3f5fa7be7c4f5c756f3017b3a8c488c3653e9179').toLowerCase();
 const UPDATE_URL = process.env.UPDATE_URL || 'https://play.google.com/store/apps/details?id=' + (process.env.PACKAGE_NAME || 'com.efahmy.finishingprojects');
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.PGSSL === '1' ? { rejectUnauthorized: false } : false, max: 5 });
@@ -137,7 +141,7 @@ async function statusPayload(acc, deviceRow) {
   const cur = devs.find(d => d.id === deviceRow);
   return { ok: true, username: acc.username, displayName: acc.display_name || '', email: acc.email || '', google: !!acc.google_sub, apple: !!acc.apple_sub, social: ['google', 'apple'].includes(acc.pass_hash) ? acc.pass_hash : '', accountId: acc.public_id, state: stateOf(acc), trialEnds: acc.trial_ends, paidAt: acc.paid_at,
     serverTime: new Date().toISOString(), productId: PRODUCT_ID, trialDays: TRIAL_DAYS,
-    updates: stateOf(acc) === 'paid', latestVersion: LATEST_VERSION, updateUrl: UPDATE_URL,
+    updates: stateOf(acc) === 'paid', latestVersion: LATEST_VERSION, updateUrl: UPDATE_URL, updateUrlIos: IOS_UPDATE_URL,
     devices: devs.map(d => ({ kind: d.kind, model: d.model, lastSeen: d.last_seen, current: d.id === deviceRow })),
     emailVerified: !!acc.email_verified, phone: acc.phone_verified ? acc.phone : '', phoneVerified: !!acc.phone_verified, phoneChannel: acc.phone_channel || 'sms', twofa: !!(acc.twofa && acc.phone_verified),
     offline: offlinePass(acc, cur && cur.device_id) };
@@ -180,7 +184,7 @@ async function socialAccount(provider, sub, email, name, dev) {
 }
 // Apple ID token check (RS256 with Apple's published keys)
 let appleKeys = null;
-async function verifyAppleToken(idToken, nonce) {
+async function verifyAppleToken(idToken, nonce, aud = APPLE_CLIENT_ID) {
   const [h, p, sig] = String(idToken || '').split('.');
   if (!h || !p || !sig) throw new HttpErr(401, 'badApple');
   const head = JSON.parse(Buffer.from(h, 'base64url').toString()), claims = JSON.parse(Buffer.from(p, 'base64url').toString());
@@ -191,8 +195,8 @@ async function verifyAppleToken(idToken, nonce) {
   const jwk = appleKeys.keys.find(k => k.kid === head.kid);
   if (!jwk || head.alg !== 'RS256') throw new HttpErr(401, 'badApple');
   const ok = crypto.verify('RSA-SHA256', Buffer.from(h + '.' + p), crypto.createPublicKey({ key: jwk, format: 'jwk' }), Buffer.from(sig, 'base64url'));
-  if (!ok || claims.iss !== 'https://appleid.apple.com' || claims.aud !== APPLE_CLIENT_ID || claims.exp * 1000 < Date.now() || !claims.sub) throw new HttpErr(401, 'badApple');
-  if (nonce && claims.nonce && claims.nonce !== nonce) throw new HttpErr(401, 'badApple');
+  if (!ok || claims.iss !== 'https://appleid.apple.com' || !aud || claims.aud !== aud || claims.exp * 1000 < Date.now() || !claims.sub) throw new HttpErr(401, 'badApple');
+  if (nonce && claims.nonce !== nonce) throw new HttpErr(401, 'badApple');
   return claims;
 }
 const applePending = new Map();     // state -> { dev, nonce, at, identity }
@@ -339,6 +343,32 @@ async function findAccount(id) {
   return (await q('select * from accounts where username=$1', [normUser(v)]))[0] || null;
 }
 
+// App Store: verify a signed transaction / notification (ES256 JWS, certificate chain pinned to Apple Root CA - G3)
+const OID_LEAF = Buffer.from('060a2a864886f76364060b01', 'hex'), OID_INTER = Buffer.from('060a2a864886f76364060201', 'hex');
+function verifyAppleJws(jws) {
+  const parts = String(jws || '').split('.'); if (parts.length !== 3) throw new HttpErr(400, 'badPurchase');
+  let head; try { head = JSON.parse(Buffer.from(parts[0], 'base64url')); } catch (e) { throw new HttpErr(400, 'badPurchase'); }
+  if (head.alg !== 'ES256' || !Array.isArray(head.x5c) || head.x5c.length < 3) throw new HttpErr(400, 'badPurchase');
+  let certs; try { certs = head.x5c.slice(0, 3).map(c => new crypto.X509Certificate(Buffer.from(c, 'base64'))); } catch (e) { throw new HttpErr(400, 'badPurchase'); }
+  const [leaf, inter, root] = certs, now = Date.now();
+  const ok = crypto.createHash('sha256').update(root.raw).digest('hex') === APPLE_ROOT_FP
+    && leaf.verify(inter.publicKey) && inter.verify(root.publicKey)
+    && certs.every(c => new Date(c.validFrom).getTime() <= now && new Date(c.validTo).getTime() >= now)
+    && leaf.raw.includes(OID_LEAF) && inter.raw.includes(OID_INTER)
+    && crypto.verify('sha256', Buffer.from(parts[0] + '.' + parts[1]), { key: leaf.publicKey, dsaEncoding: 'ieee-p1363' }, Buffer.from(parts[2], 'base64url'));
+  if (!ok) throw new HttpErr(400, 'badPurchase');
+  return JSON.parse(Buffer.from(parts[1], 'base64url'));
+}
+const looksLikeJws = t => /^eyJ[\w-]+\.[\w-]+\.[\w-]+$/.test(t);
+async function appleRefund(originalTransactionId, info) {
+  const rows = await q(`update purchases set state='voided', detail=coalesce(detail,'{}'::jsonb) || $2::jsonb where token=$1 and state<>'voided' returning account_id`, ['apple:' + originalTransactionId, JSON.stringify({ voided: info })]);
+  for (const r of rows) if (r.account_id) {
+    const [still] = await q(`select 1 from purchases where account_id=$1 and state='purchased'`, [r.account_id]);
+    if (!still) await q(`update accounts set paid=false, note=left(coalesce(note,'') || ' [App Store refund ' || to_char(now(),'YYYY-MM-DD') || ']', 500) where id=$1 and paid and paid_via='app_store'`, [r.account_id]);
+  }
+  return rows.length;
+}
+
 // refunds and chargebacks: Google lists voided purchases; the full version is removed from those accounts
 async function checkVoided() {
   const sa = serviceAccount(); if (!sa || !dbReady) return;
@@ -369,6 +399,7 @@ setInterval(() => { const old = Date.now() - 10 * 60e3; for (const [k, v] of non
 const integrityOn = () => INTEGRITY_MODE !== 'off' && !!serviceAccount();
 async function checkIntegrity(b, where) {
   if (!integrityOn()) return null;
+  if (b.platform === 'ios') { console.log('integrity', where, 'ios (not checked)'); return null; }   // Play Integrity is Android only
   const fail = code => { console.log('integrity', where, code); if (INTEGRITY_MODE === 'enforce') throw new HttpErr(403, code); return code; };
   const nonce = String(b.nonce || ''), token = String(b.integrity || ''), n = nonces.get(nonce);
   if (!token || !n) return fail(b.integrityError ? 'integrityUnavailable' : 'integrityRequired');
@@ -437,6 +468,30 @@ const routes = {
     return { __html: page('Tashtibati', `<div class="card" style="text-align:center"><h1>${ok ? 'تم تسجيل الدخول بحساب Apple' : 'تعذر تسجيل الدخول بحساب Apple'}</h1>
       <p><a href="${link}"><button>العودة إلى تطبيق تشطيباتى</button></a></p><p class="muted">${ok ? 'Signed in with Apple — return to the app.' : 'Apple sign-in failed — return to the app and try again.'}</p></div>
       <script>setTimeout(function(){location.href=${JSON.stringify(link)}},300)</script>`) };
+  },
+  // Sign in with Apple inside the iPhone / iPad app (the token's audience is the app's bundle id)
+  'POST /api/apple/native': async (req, b) => {
+    limit('apple:' + req.ip, 30, 600e3);
+    const raw = String(b.rawNonce || ''); if (raw.length < 16) throw new HttpErr(400, 'badApple');
+    const c = await verifyAppleToken(b.idToken, sha(raw), IOS_BUNDLE_ID);
+    const dev = readDevice(b), integ = await checkIntegrity(b, 'apple');
+    const { acc, created, usedTrial } = await socialAccount('apple', c.sub, c.email || null, String(b.name || '').slice(0, 80), dev);
+    const passed = await twoStep(acc, dev, b);
+    const row = await attachDevice(acc, dev, !!b.transfer); await markIntegrity(row, integ); if (passed) otpPassed.delete(passed);
+    return { ...(await statusPayload(acc, row)), token: await newSession(acc, row), created, trialUsedOnDevice: usedTrial };
+  },
+  // App Store Server Notifications (version 2): refunds and revoked purchases remove the full version
+  'POST /api/apple/notifications': async (req, b) => {
+    limit('asn:' + req.ip, 120, 600e3);
+    const n = verifyAppleJws(b.signedPayload);
+    const d = n.data || {};
+    if (d.bundleId && d.bundleId !== IOS_BUNDLE_ID) return { ok: true };
+    if (['REFUND', 'REVOKE'].includes(n.notificationType) && d.signedTransactionInfo) {
+      const t = verifyAppleJws(d.signedTransactionInfo);
+      const k = await appleRefund(t.originalTransactionId, { type: n.notificationType, at: Date.now(), transactionId: t.transactionId });
+      console.log('app store', n.notificationType, 'purchases updated:', k);
+    }
+    return { ok: true };
   },
   'POST /api/apple/finish': async (req, b) => {
     const p = applePending.get(String(b.state || ''));
@@ -651,6 +706,22 @@ Include every labelled room or space. Only give numbers you can actually read �
     const s = await auth(req);
     const token = String(b.purchaseToken || ''); const productId = String(b.productId || PRODUCT_ID);
     if (token.length < 10) throw new HttpErr(400, 'badPurchase');
+    if (looksLikeJws(token)) {          // App Store (iPhone / iPad)
+      const t = verifyAppleJws(token);
+      const key = 'apple:' + t.originalTransactionId;
+      const [prev] = await q('select * from purchases where token=$1', [key]);
+      if (prev && prev.account_id && prev.account_id !== s.id) throw new HttpErr(409, 'purchaseOtherAccount');
+      let state = 'purchased';
+      if (t.bundleId !== IOS_BUNDLE_ID || t.productId !== PRODUCT_ID) state = 'error';
+      else if (t.appAccountToken && String(t.appAccountToken).toLowerCase() !== String(s.public_id).toLowerCase()) state = 'wrongAccount';
+      else if (t.revocationDate) state = 'cancelled';
+      await q(`insert into purchases(account_id, token, order_id, product_id, state, detail) values($1,$2,$3,$4,$5,$6)
+               on conflict (token) do update set state=excluded.state, detail=excluded.detail, account_id=excluded.account_id`,
+        [s.id, key, String(t.transactionId || '').slice(0, 64), t.productId, state, JSON.stringify({ store: 'app_store', environment: t.environment, purchaseDate: t.purchaseDate, transactionId: t.transactionId })]);
+      if (state === 'purchased') await q(`update accounts set paid=true, paid_at=coalesce(paid_at, now()), paid_via='app_store' where id=$1`, [s.id]);
+      const [acc2] = await q('select * from accounts where id=$1', [s.id]);
+      return { ...(await statusPayload(acc2, s.device_row)), purchase: state };
+    }
     const [old] = await q('select * from purchases where token=$1', [token]);
     if (old && old.account_id && old.account_id !== s.id) throw new HttpErr(409, 'purchaseOtherAccount');
     const v = await verifyPlay(token, productId).catch(e => ({ configured: true, error: e.message }));
