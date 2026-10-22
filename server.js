@@ -22,6 +22,15 @@ const AI_MODEL = process.env.SUPPORT_MODEL || 'claude-haiku-5-5';
 const PLAN_MODEL = process.env.PLAN_MODEL || 'claude-sonnet-5-5';     // reads room names and sizes from plan photos
 const HELP = require('./help.js');
 const LATEST_VERSION = process.env.LATEST_VERSION || '';           // newest app version, e.g. 2.2.0
+const AI_DAILY_CAP = +process.env.AI_DAILY_CAP || 1500;            // cost guard: AI calls per day for the whole app
+const SESSION_DAYS = +process.env.SESSION_DAYS || 90;              // a sign-in unused this long expires
+const INTEGRITY_MODE = (process.env.INTEGRITY_MODE || 'off').toLowerCase();   // Play Integrity: off | log | enforce
+const INTEGRITY_PROJECT = process.env.INTEGRITY_PROJECT || '';     // Google Cloud project number (for copies installed outside Google Play)
+const INTEGRITY_DEVICE = process.env.INTEGRITY_DEVICE === 'basic' ? 'basic' : 'device';
+// signing certificate(s) of copies installed outside Google Play (SHA-256, hex or base64). Copies from Play are recognised by Google.
+const INTEGRITY_CERTS = (process.env.INTEGRITY_CERTS || '35:BB:C5:52:7B:14:E3:1C:DD:3C:8E:8E:DF:D9:16:2B:A3:0E:90:CF:02:8D:20:D7:40:0E:7C:80:8E:C2:43:71').split(',').map(x => hexOf(x)).filter(Boolean);
+function hexOf(v) { v = String(v || '').trim(); if (/^[0-9a-f:]{64,95}$/i.test(v)) return v.replace(/:/g, '').toLowerCase();
+  try { return Buffer.from(v.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('hex'); } catch (e) { return ''; } }
 const UPDATE_URL = process.env.UPDATE_URL || 'https://play.google.com/store/apps/details?id=' + (process.env.PACKAGE_NAME || 'com.efahmy.finishingprojects');
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.PGSSL === '1' ? { rejectUnauthorized: false } : false, max: 5 });
@@ -57,6 +66,8 @@ async function migrate() {
     create table if not exists purchases (
       id serial primary key, account_id int references accounts(id) on delete set null, token text not null unique,
       order_id text, product_id text, state text not null, detail jsonb, created_at timestamptz not null default now());
+    alter table devices add column if not exists integrity text;
+    create index if not exists sessions_last_seen on sessions(last_seen);
   `);
 }
 
@@ -87,6 +98,19 @@ function limit(key, max, ms) {
   if (h.n > max) throw new HttpErr(429, 'tooMany');
 }
 setInterval(() => { const now = Date.now(); for (const [k, h] of hits) if (now > h.until) hits.delete(k); }, 60000).unref();
+// soft limit: true while under the limit (no error)
+function under(key, max, ms) { try { limit(key, max, ms); return true; } catch (e) { return false; } }
+// whole-app daily budget for AI calls, so a misuse can never run up a large bill
+const aiDay = { day: '', n: 0 };
+function aiBudget(cost) { const d = new Date().toISOString().slice(0, 10); if (aiDay.day !== d) { aiDay.day = d; aiDay.n = 0; }
+  if (aiDay.n + cost > AI_DAILY_CAP) { if (aiDay.n <= AI_DAILY_CAP) console.error('AI daily cap reached'); aiDay.n = AI_DAILY_CAP + 1; return false; } aiDay.n += cost; return true; }
+// the visitor's real address: the edge (Cloudflare) sets True-Client-IP / CF-Connecting-IP and overwrites any value the visitor sends
+function clientIp(req) {
+  const h = req.headers, edge = h['true-client-ip'] || h['cf-connecting-ip'];
+  if (edge) return String(edge).trim();
+  const xff = String(h['x-forwarded-for'] || '').split(',').map(x => x.trim()).filter(Boolean);
+  return xff[0] || req.socket.remoteAddress || '';
+}
 
 function stateOf(acc) { if (acc.paid) return 'paid'; return new Date(acc.trial_ends) > new Date() ? 'trial' : 'expired'; }
 async function statusPayload(acc, deviceRow) {
@@ -159,9 +183,10 @@ async function newSession(acc, deviceRow) {
 async function auth(req) {
   const m = /^Bearer\s+([a-f0-9]{64})$/i.exec(req.headers.authorization || '');
   if (!m) throw new HttpErr(401, 'noSession');
-  const [s] = await q(`select s.token_hash, s.device_row, d.active as dev_active, a.* from sessions s join accounts a on a.id=s.account_id
+  const [s] = await q(`select s.token_hash, s.device_row, s.last_seen as session_seen, d.active as dev_active, a.* from sessions s join accounts a on a.id=s.account_id
                        left join devices d on d.id=s.device_row where s.token_hash=$1`, [sha(m[1])]);
   if (!s) throw new HttpErr(401, 'noSession');
+  if (new Date(s.session_seen) < Date.now() - SESSION_DAYS * 864e5) { await q('delete from sessions where token_hash=$1', [s.token_hash]); throw new HttpErr(401, 'sessionExpired'); }
   if (s.device_row && s.dev_active === false) throw new HttpErr(401, 'deviceRemoved');
   await q('update sessions set last_seen=now() where token_hash=$1', [s.token_hash]);
   if (s.device_row) await q('update devices set last_seen=now() where id=$1', [s.device_row]);
@@ -169,21 +194,23 @@ async function auth(req) {
 }
 
 // ---------- Google Play verification (needs a service account with access in Play Console) ----------
-let gTok = null;
-async function googleToken(sa) {
+const gToks = {};
+function serviceAccount() { try { return process.env.GOOGLE_SERVICE_ACCOUNT ? JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT) : null; } catch (e) { return null; } }
+async function googleToken(sa, scope = 'https://www.googleapis.com/auth/androidpublisher') {
+  const gTok = gToks[scope];
   if (gTok && gTok.exp > Date.now() + 60000) return gTok.token;
   const b64 = o => Buffer.from(JSON.stringify(o)).toString('base64url');
   const now = Math.floor(Date.now() / 1000);
-  const unsigned = `${b64({ alg: 'RS256', typ: 'JWT' })}.${b64({ iss: sa.client_email, scope: 'https://www.googleapis.com/auth/androidpublisher', aud: sa.token_uri || 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600 })}`;
+  const unsigned = `${b64({ alg: 'RS256', typ: 'JWT' })}.${b64({ iss: sa.client_email, scope, aud: sa.token_uri || 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600 })}`;
   const sig = crypto.createSign('RSA-SHA256').update(unsigned).sign(sa.private_key).toString('base64url');
   const r = await fetch(sa.token_uri || 'https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: `${unsigned}.${sig}` }) });
   const j = await r.json(); if (!r.ok) throw new Error('google token: ' + (j.error_description || j.error || r.status));
-  gTok = { token: j.access_token, exp: Date.now() + (j.expires_in || 3600) * 1000 };
-  return gTok.token;
+  gToks[scope] = { token: j.access_token, exp: Date.now() + (j.expires_in || 3600) * 1000 };
+  return j.access_token;
 }
 async function verifyPlay(token, productId) {
-  let sa = null; try { sa = process.env.GOOGLE_SERVICE_ACCOUNT ? JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT) : null; } catch (e) { sa = null; }
+  const sa = serviceAccount();
   if (!sa) return { configured: false };
   const at = await googleToken(sa);
   const url = `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${encodeURIComponent(PACKAGE)}/purchases/products/${encodeURIComponent(productId)}/tokens/${encodeURIComponent(token)}`;
@@ -196,10 +223,67 @@ async function verifyPlay(token, productId) {
   return { configured: true, data: j };
 }
 
+// refunds and chargebacks: Google lists voided purchases; the full version is removed from those accounts
+async function checkVoided() {
+  const sa = serviceAccount(); if (!sa || !dbReady) return;
+  try {
+    const at = await googleToken(sa); let pageTok = '', removed = 0;
+    do {
+      const u = new URL(`https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${encodeURIComponent(PACKAGE)}/purchases/voidedpurchases`);
+      u.searchParams.set('startTime', String(Date.now() - 30 * 864e5)); u.searchParams.set('maxResults', '1000'); if (pageTok) u.searchParams.set('token', pageTok);
+      const r = await fetch(u, { headers: { authorization: 'Bearer ' + at } }); const j = await r.json().catch(() => ({}));
+      if (!r.ok) { console.error('voided purchases', r.status, j.error && j.error.message); return; }
+      for (const v of j.voidedPurchases || []) {
+        const rows = await q(`update purchases set state='voided', detail=coalesce(detail,'{}'::jsonb) || $2::jsonb where token=$1 and state<>'voided' returning account_id`, [v.purchaseToken, JSON.stringify({ voided: v })]);
+        for (const p of rows) if (p.account_id) {
+          const [still] = await q(`select 1 from purchases where account_id=$1 and state='purchased'`, [p.account_id]);
+          if (!still) { const u2 = await q(`update accounts set paid=false, note=left(coalesce(note,'') || ' [refund ' || to_char(now(),'YYYY-MM-DD') || ']', 500) where id=$1 and paid and paid_via='google_play' returning id`, [p.account_id]); removed += u2.length; }
+        }
+      }
+      pageTok = (j.tokenPagination && j.tokenPagination.nextPageToken) || '';
+    } while (pageTok);
+    if (removed) console.log('refunds: full version removed from', removed, 'account(s)');
+  } catch (e) { console.error('voided purchases', e.message); }
+}
+setInterval(checkVoided, 6 * 3600e3).unref();
+
+// Play Integrity: is this the real app (from Google Play, or our own signed copy) on a real, unmodified device?
+const nonces = new Map();   // nonce -> { at, tokenHash, verdict }
+setInterval(() => { const old = Date.now() - 10 * 60e3; for (const [k, v] of nonces) if (v.at < old) nonces.delete(k); }, 60000).unref();
+const integrityOn = () => INTEGRITY_MODE !== 'off' && !!serviceAccount();
+async function checkIntegrity(b, where) {
+  if (!integrityOn()) return null;
+  const fail = code => { console.log('integrity', where, code); if (INTEGRITY_MODE === 'enforce') throw new HttpErr(403, code); return code; };
+  const nonce = String(b.nonce || ''), token = String(b.integrity || ''), n = nonces.get(nonce);
+  if (!token || !n) return fail(b.integrityError ? 'integrityUnavailable' : 'integrityRequired');
+  const th = sha(token);
+  if (n.tokenHash) { if (n.tokenHash !== th) return fail('integrityFailed'); return n.verdict === 'ok' ? 'ok' : fail(n.verdict); }   // same request retried (e.g. moving devices)
+  n.tokenHash = th;
+  let p;
+  try {
+    const at = await googleToken(serviceAccount(), 'https://www.googleapis.com/auth/playintegrity');
+    const r = await fetch(`https://playintegrity.googleapis.com/v1/${encodeURIComponent(PACKAGE)}:decodeIntegrityToken`, { method: 'POST', headers: { authorization: 'Bearer ' + at, 'content-type': 'application/json' }, body: JSON.stringify({ integrity_token: token }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { console.error('integrity decode', r.status, j.error && j.error.message); n.verdict = 'ok'; return null; }   // Google-side problem: never lock users out for it
+    p = j.tokenPayloadExternal || {};
+  } catch (e) { console.error('integrity', e.message); n.verdict = 'ok'; return null; }
+  const norm = x => String(x || '').replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+  const rd = p.requestDetails || {}, app = p.appIntegrity || {}, dv = (p.deviceIntegrity || {}).deviceRecognitionVerdict || [];
+  const okDevice = INTEGRITY_DEVICE === 'basic' ? dv.length > 0 : dv.some(x => x === 'MEETS_DEVICE_INTEGRITY' || x === 'MEETS_STRONG_INTEGRITY');
+  let v = 'ok';
+  if (norm(rd.nonce) !== norm(nonce) || (rd.requestPackageName && rd.requestPackageName !== PACKAGE) || Math.abs(Date.now() - (+rd.timestampMillis || 0)) > 15 * 60e3) v = 'integrityFailed';
+  else if (!okDevice) v = 'integrityDevice';
+  else if (app.appRecognitionVerdict !== 'PLAY_RECOGNIZED' && !(app.packageName === PACKAGE && (app.certificateSha256Digest || []).some(c => INTEGRITY_CERTS.includes(hexOf(c))))) v = 'integrityApp';
+  n.verdict = v;
+  return v === 'ok' ? 'ok' : fail(v);
+}
+const markIntegrity = (row, v) => v ? q('update devices set integrity=$2 where id=$1', [row, v]) : null;
+
 // ---------- API ----------
 const routes = {
   'GET /health': async () => ({ ok: true, db: dbReady }),
-  'GET /api/config': async () => ({ ok: true, productId: PRODUCT_ID, trialDays: TRIAL_DAYS, googleClientId: GOOGLE_CLIENT_ID, apple: !!APPLE_CLIENT_ID, support: SUPPORT_EMAIL, ai: !!AI_KEY, latestVersion: LATEST_VERSION, updateUrl: UPDATE_URL }),
+  'GET /api/config': async () => ({ ok: true, productId: PRODUCT_ID, trialDays: TRIAL_DAYS, googleClientId: GOOGLE_CLIENT_ID, apple: !!APPLE_CLIENT_ID, support: SUPPORT_EMAIL, ai: !!AI_KEY, latestVersion: LATEST_VERSION, updateUrl: UPDATE_URL, integrity: integrityOn(), integrityProject: INTEGRITY_PROJECT }),
+  'POST /api/nonce': async (req) => { limit('nonce:' + req.ip, 60, 600e3); const n = crypto.randomBytes(24).toString('base64url'); nonces.set(n, { at: Date.now() }); return { ok: true, nonce: n }; },
 
   // Sign in with Google: the app sends the Google ID token; Google confirms it; first sign-in creates the account
   'POST /api/google': async (req, b) => {
@@ -209,8 +293,9 @@ const routes = {
     const g = await r.json().catch(() => ({}));
     if (!r.ok || g.aud !== GOOGLE_CLIENT_ID || !/^(https:\/\/)?accounts\.google\.com$/.test(g.iss || '') || +g.exp * 1000 < Date.now() || !g.sub) throw new HttpErr(401, 'badGoogle');
     const dev = readDevice(b);
+    const integ = await checkIntegrity(b, 'google');
     const { acc, created, usedTrial } = await socialAccount('google', g.sub, g.email_verified === 'true' || g.email_verified === true ? g.email : null, g.name || b.name || '', dev);
-    const row = await attachDevice(acc, dev, !!b.transfer);
+    const row = await attachDevice(acc, dev, !!b.transfer); await markIntegrity(row, integ);
     return { ...(await statusPayload(acc, row)), token: await newSession(acc, row), created, trialUsedOnDevice: usedTrial };
   },
 
@@ -219,7 +304,8 @@ const routes = {
     limit('apple:' + req.ip, 30, 600e3);
     if (!APPLE_CLIENT_ID) throw new HttpErr(503, 'appleNotConfigured');
     const dev = readDevice(b), state = crypto.randomBytes(16).toString('hex'), nonce = crypto.randomBytes(16).toString('hex');
-    applePending.set(state, { dev, nonce, at: Date.now() });
+    const integ = await checkIntegrity(b, 'apple');
+    applePending.set(state, { dev, nonce, at: Date.now(), integ });
     const u = new URL('https://appleid.apple.com/auth/authorize');
     u.search = new URLSearchParams({ client_id: APPLE_CLIENT_ID, redirect_uri: PUBLIC_URL + '/auth/apple/callback', response_type: 'code id_token', response_mode: 'form_post', scope: 'name email', state, nonce }).toString();
     return { ok: true, url: u.toString(), state };
@@ -241,7 +327,7 @@ const routes = {
     if (p.error) throw new HttpErr(401, p.error);
     if (!p.identity) throw new HttpErr(409, 'appleNotDone');
     const { acc, created, usedTrial } = await socialAccount('apple', p.identity.sub, p.identity.email, p.identity.name, p.dev);
-    const row = await attachDevice(acc, p.dev, !!b.transfer);
+    const row = await attachDevice(acc, p.dev, !!b.transfer); await markIntegrity(row, p.integ);
     applePending.delete(String(b.state));
     return { ...(await statusPayload(acc, row)), token: await newSession(acc, row), created, trialUsedOnDevice: usedTrial };
   },
@@ -256,7 +342,8 @@ const routes = {
     while (msgs.length && msgs[0].role !== 'user') msgs.shift();
     if (!msgs.length) throw new HttpErr(400, 'empty');
     const last = msgs[msgs.length - 1].content;
-    if (AI_KEY) {
+    // the AI answers signed-in users only (limited per account and per day for the whole app); everyone else gets the help articles
+    if (AI_KEY && who && under('aiu:' + who.id, 60, 864e5) && aiBudget(1)) {
       const kb = HELP.map(a => `## ${a.en.t} / ${a.ar.t}\n${a.en.b}\n${a.ar.b}`).join('\n\n');
       const acct = who ? `The user is signed in as "${who.username}"; account state: ${stateOf(who)}${stateOf(who) === 'trial' ? ' (trial ends ' + new Date(who.trial_ends).toISOString().slice(0, 10) + ')' : ''}.` : 'The user is not signed in.';
       const system = `You are the customer-support assistant inside the Tashtibati (تشطيباتى) Android app, used by finishing/fit-out site engineers in Egypt to track project accounts, WhatsApp groups, agreements, files and Excel reports.
@@ -306,6 +393,7 @@ ${kb}`;
     if (stateOf(s) === 'expired') throw new HttpErr(403, 'expired');
     limit('plan:' + s.id, 40, 864e5);
     if (!AI_KEY) throw new HttpErr(503, 'aiNotConfigured');
+    if (!aiBudget(3)) throw new HttpErr(503, 'aiBusy');
     const data = String(b.image || ''), media = /^image\/(png|webp|gif)$/.test(b.mediaType) ? b.mediaType : 'image/jpeg';
     if (data.length < 200 || !/^[A-Za-z0-9+/=]+$/.test(data.slice(0, 200))) throw new HttpErr(400, 'badImage');
     const types = 'bedroom, master, reception, living, dining, kitchen, bathroom, toilet, dressing, corridor, stairs, entrance, balcony, terrace, maid, laundry, storage, office, shop, hall, warehouse, production, parking, loading, yard, garden, pool, roof, other';
@@ -342,13 +430,15 @@ Include every labelled room or space. Only give numbers you can actually read �
     if (!validUser(username)) throw new HttpErr(400, 'badUsername');
     if (pw.length < 8 || pw.length > 128) throw new HttpErr(400, 'weakPassword');
     const dev = readDevice(b);
+    limit('regdev:' + dev.id, 5, 864e5); limit('regall', 300, 3600e3);
+    const integ = await checkIntegrity(b, 'register');
     const [exists] = await q('select 1 from accounts where username=$1', [username]);
     if (exists) throw new HttpErr(409, 'usernameTaken');
     const [usedTrial] = await q('select 1 from trial_devices where device_id=$1', [dev.id]);
     const trialEnds = usedTrial ? new Date() : new Date(Date.now() + TRIAL_DAYS * 864e5);
     const [acc] = await q('insert into accounts(public_id, username, pass_hash, trial_ends) values($1,$2,$3,$4) returning *', [crypto.randomUUID(), username, hashPassword(pw), trialEnds]);
     if (!usedTrial) await q('insert into trial_devices(device_id, account_id) values($1,$2) on conflict do nothing', [dev.id, acc.id]);
-    const row = await attachDevice(acc, dev, false);
+    const row = await attachDevice(acc, dev, false); await markIntegrity(row, integ);
     return { ...(await statusPayload(acc, row)), token: await newSession(acc, row), trialUsedOnDevice: !!usedTrial };
   },
 
@@ -356,8 +446,9 @@ Include every labelled room or space. Only give numbers you can actually read �
     const username = normUser(b.username);
     limit('login:' + req.ip, 30, 600e3); limit('user:' + username, 10, 900e3);
     const [acc] = await q('select * from accounts where username=$1', [username]);
-    if (!acc || !checkPassword(String(b.password || ''), acc.pass_hash)) throw new HttpErr(401, 'badLogin');
-    const row = await attachDevice(acc, readDevice(b), !!b.transfer);
+    if (!acc || !checkPassword(String(b.password || ''), acc.pass_hash)) { limit('loginfail', 600, 3600e3); throw new HttpErr(401, 'badLogin'); }
+    const dev = readDevice(b), integ = await checkIntegrity(b, 'login');
+    const row = await attachDevice(acc, dev, !!b.transfer); await markIntegrity(row, integ);
     hits.delete('user:' + username);
     return { ...(await statusPayload(acc, row)), token: await newSession(acc, row) };
   },
@@ -437,19 +528,36 @@ Include every labelled room or space. Only give numbers you can actually read �
   'GET /admin/api/tickets': async (req) => { adminAuth(req);
     return { ok: true, tickets: await q(`select id, username, contact, subject, message, transcript, lang, device, status, created_at from support_tickets order by (status='open') desc, created_at desc limit 200`) }; },
   'POST /admin/api/ticket': async (req, b) => { adminAuth(req); await q('update support_tickets set status=$2 where id=$1', [+b.id, b.status === 'open' ? 'open' : 'closed']); return { ok: true }; },
+  // Google / Apple accounts have no password: the web form files a deletion request that the admin completes after checking
+  'POST /delete-account/request': async (req, b) => {
+    limit('delreq:' + req.ip, 5, 3600e3);
+    const username = normUser(b.username), contact = String(b.contact || '').slice(0, 120);
+    if (!username || !contact) throw new HttpErr(400, 'missing');
+    const [acc] = await q('select id, username, email from accounts where username=$1', [username]);
+    await q(`insert into support_tickets(account_id, username, contact, subject, message, lang) values($1,$2,$3,$4,$5,'ar')`,
+      [acc ? acc.id : null, username, contact, 'طلب حذف حساب (Google / Apple)', `طلب حذف الحساب من صفحة الحذف. ${acc ? 'البريد المسجل: ' + (acc.email || '—') : 'لا يوجد حساب بهذا الاسم.'}`]);
+    return { ok: true };
+  },
   'POST /delete-account': async (req, b) => {         // web form for Google Play's account-deletion requirement
     limit('del:' + req.ip, 10, 3600e3);
     const [acc] = await q('select * from accounts where username=$1', [normUser(b.username)]);
+    limit('deluser:' + normUser(b.username), 10, 900e3);
     if (!acc || !checkPassword(String(b.password || ''), acc.pass_hash)) throw new HttpErr(401, 'badLogin');
     await q('delete from accounts where id=$1', [acc.id]);
     return { ok: true };
   },
 };
+let adminFails = { n: 0, until: 0 };
 function adminAuth(req) {
   if (!ADMIN_USER || !ADMIN_PASSWORD) throw new HttpErr(503, 'adminNotConfigured');
+  if (adminFails.n >= 60 && Date.now() < adminFails.until) throw new HttpErr(429, 'tooMany');
+  if (req.method === 'POST') {    // changes only from the admin page itself (blocks other sites from using a signed-in browser)
+    const site = req.headers['sec-fetch-site'], origin = req.headers.origin;
+    if (!/application\/json/.test(req.headers['content-type'] || '') || (site && !['same-origin', 'none'].includes(site)) || (origin && origin !== PUBLIC_URL && origin !== 'https://' + req.headers.host)) throw new HttpErr(403, 'badOrigin');
+  }
   const m = /^Basic\s+(.+)$/i.exec(req.headers.authorization || '');
   const [u, p] = m ? Buffer.from(m[1], 'base64').toString().split(/:(.*)/s) : [];
-  if (!m || !safeEq(u, ADMIN_USER) || !safeEq(p || '', ADMIN_PASSWORD)) { limit('admin:' + req.ip, 20, 600e3); throw new HttpErr(401, 'admin', { basic: true }); }
+  if (!m || !safeEq(u, ADMIN_USER) || !safeEq(p || '', ADMIN_PASSWORD)) { if (Date.now() > adminFails.until) adminFails = { n: 0, until: Date.now() + 3600e3 }; adminFails.n++; limit('admin:' + req.ip, 20, 600e3); throw new HttpErr(401, 'admin', { basic: true }); }
 }
 
 // ---------- pages ----------
@@ -466,19 +574,29 @@ const PRIVACY = page('سياسة الخصوصية وشروط الاستخدام 
 <h2>بيانات الحساب على خادمنا</h2><p>اسم المستخدم، وكلمة المرور مخزنة بشكل مشفّر (لا يمكن قراءتها)، أو معرّف حساب Google أو Apple وبريده واسمه عند الدخول بهما، وتاريخ الفترة التجريبية، وحالة الشراء من Google Play (رقم الطلب ورمز الشراء)، ومعرّف الجهاز ونوعه وطرازه لتطبيق قاعدة الجهاز الواحد لكل حساب ومنع تكرار الفترة التجريبية على نفس الجهاز.</p>
 <h2>بيانات المشاريع والنسخ الاحتياطي</h2><p>بيانات المشاريع (الحسابات والاتفاقات والملفات) تُحفظ على جهازك. النسخ الاحتياطي يكون حسب اختيارك: في مجلد «Tashtibati» داخل Google Drive الخاص بك، أو ملف على جهازك ترسله لأي سحابة، أو iCloud في نسخة الآيفون. لا تُرسل بيانات المشاريع إلى خادمنا.</p>
 <h2>واتساب والموقع</h2><p>قراءة إشعارات واتساب (عند تفعيلها بموافقتك) تتم على جهازك فقط، ويُحفظ منها رسائل التحويلات ورسائل جروب فريق العمل الذي تختاره. موقع المشروع يُحفظ على جهازك عند طلبك.</p>
-<h2>المساعدة والدعم</h2><p>أسئلتك للمساعد الذكي داخل التطبيق تُرسل إلى خادمنا ومزوّد الذكاء الاصطناعي (Anthropic) لتوليد الرد فقط، ولا تُستخدم لأي غرض آخر. الطلبات المحوّلة للدعم تُحفظ لدينا مع اسم المستخدم لمتابعتها، وتُرسل بالبريد إلى ${SUPPORT_EMAIL}.</p>
-<h2>الشراء والتحديثات</h2><p>النسخة الكاملة شراء لمرة واحدة عبر Google Play، وتشمل حق تنزيل التطبيق وجميع تحديثاته المستقبلية لنفس الحساب، وإعادة تثبيته على جهازك. الحساب يعمل على جهاز واحد، ويمكن نقله لجهاز جديد بعد الشراء، وعندها يُزال الجهاز القديم ولا يمكنه الدخول لهذا الحساب مرة أخرى. الفترة التجريبية مرة واحدة لكل جهاز.</p>
-<h2>حذف الحساب</h2><p>يمكنك حذف حسابك من داخل التطبيق (الحساب ← حذف الحساب) أو من <a href="/delete-account">صفحة حذف الحساب</a>. يُحذف الحساب وبيانات الأجهزة والجلسات فورًا. بيانات مشاريعك على جهازك ونسخك الاحتياطية تبقى ملكك وتحت تحكمك.</p>
+<h2>قراءة المخططات بالذكاء الاصطناعي</h2><p>عند اختيارك قراءة مخطط من صورة، تُرسل الصورة عبر خادمنا إلى مزوّد الذكاء الاصطناعي (Anthropic) لاستخراج أسماء الغرف ومقاساتها فقط، ولا نحتفظ بها. إذا لم تستخدم هذه الخاصية لا تُرسل أي صورة.</p>
+<h2>بيانات الآخرين في رسائلك</h2><p>رسائل واتساب التي يحفظها التطبيق قد تحتوي أسماء وأرقام عملاء ومقاولين وأعضاء فريقك. تُحفظ على جهازك ونسخك الاحتياطية فقط، وأنت مسؤول عن استخدامها لأغراض عملك وبما يتفق مع القانون (ومنه قانون حماية البيانات الشخصية رقم 151 لسنة 2020).</p>
+<h2>الحماية</h2><p>الاتصال بخادمنا مشفّر (HTTPS). تسجيل الدخول ينتهي بعد ${SESSION_DAYS} يومًا دون استخدام. قد يستخدم التطبيق خدمة Google Play Integrity للتأكد أنه النسخة الأصلية على جهاز سليم، وتُرسل Google لنا النتيجة فقط. بيانات التطبيق لا تُنسخ في نسخ Android الاحتياطية التلقائية ولا تنتقل لجهاز آخر إلا عبر النسخ الاحتياطي الذي تختاره، ويمكنك حماية ملف النسخة الاحتياطية بكلمة مرور (تشفير AES-256)؛ إذا نسيتها لا يمكن فتح الملف.</p>
+<h2>المساعدة والدعم</h2><p>أسئلتك للمساعد الذكي داخل التطبيق (بعد تسجيل الدخول) تُرسل إلى خادمنا ومزوّد الذكاء الاصطناعي (Anthropic) لتوليد الرد فقط، ولا تُستخدم لأي غرض آخر. الطلبات المحوّلة للدعم تُحفظ لدينا مع اسم المستخدم لمتابعتها، وتُرسل بالبريد إلى ${SUPPORT_EMAIL}.</p>
+<h2>الشراء والتحديثات</h2><p>النسخة الكاملة شراء لمرة واحدة عبر Google Play، وتشمل حق تنزيل التطبيق وجميع تحديثاته المستقبلية لنفس الحساب، وإعادة تثبيته على جهازك. الحساب يعمل على جهاز واحد، ويمكن نقله لجهاز جديد بعد الشراء، وعندها يُزال الجهاز القديم ولا يمكنه الدخول لهذا الحساب مرة أخرى. الفترة التجريبية مرة واحدة لكل جهاز. إذا استُرد مبلغ الشراء من Google Play يعود الحساب إلى النسخة المنتهية.</p>
+<h2>حذف الحساب</h2><p>يمكنك حذف حسابك من داخل التطبيق (الحساب ← حذف الحساب) أو من <a href="/delete-account">صفحة حذف الحساب</a> (لحسابات Google وApple تُرسل طلبًا ونحذفه خلال 7 أيام). يُحذف الحساب وبيانات الأجهزة والجلسات فورًا. بيانات مشاريعك على جهازك ونسخك الاحتياطية تبقى ملكك وتحت تحكمك.</p>
 <h2>التواصل</h2><p>${CONTACT}</p>
 <hr><h1 dir="ltr" style="text-align:left">Privacy policy and terms — Tashtibati</h1><div dir="ltr" style="text-align:left">
 <p>Our server stores your username and a hashed password (or your Google / Apple account id, email and name when you sign in with them), trial dates, Google Play purchase details, and the id, type and model of your device, to apply the one-device-per-account rule and to give each device only one free trial. Project data stays on your device; backups go where you choose: a "Tashtibati" folder in your own Google Drive, a file on your device that you can send to any cloud, or iCloud on the iPhone version. Project data is never sent to our server. WhatsApp notification reading (only with your consent) happens on the device.</p>
-<p>Questions to the in-app support assistant are sent to our server and our AI provider (Anthropic) only to produce the reply. Issues passed to support are stored with your username and emailed to ${SUPPORT_EMAIL}.</p>
-<p>The full version is a one-time Google Play purchase and includes the right to download the app and all its future updates on the same account, and to reinstall it on your device. An account works on one device; after purchase it can be moved to a new device, and the old device is then removed and cannot sign in to that account again. You can delete your account in the app or at <a href="/delete-account">/delete-account</a>. Contact: ${CONTACT}</p></div>`);
+<p>When you choose to read a floor plan from a photo, the photo is sent through our server to our AI provider (Anthropic) only to extract room names and sizes, and is not kept. WhatsApp messages the app keeps may contain names and numbers of clients, contractors and your team; they stay on your device and in your own backups, and you are responsible for using them lawfully for your work (including Egypt's Personal Data Protection Law No. 151 of 2020).</p>
+<p>Security: all traffic to our server is encrypted (HTTPS); a sign-in expires after ${SESSION_DAYS} days without use; the app may use Google Play Integrity to confirm it is the genuine app on a genuine device (Google sends us only the verdict); app data is excluded from Android's automatic backup and device-to-device transfer; backup files can be protected with a password (AES-256 encryption — a forgotten password cannot be recovered). If a Google Play purchase is refunded, the account returns to the expired state.</p>
+<p>Questions to the in-app support assistant (when signed in) are sent to our server and our AI provider (Anthropic) only to produce the reply. Issues passed to support are stored with your username and emailed to ${SUPPORT_EMAIL}.</p>
+<p>The full version is a one-time Google Play purchase and includes the right to download the app and all its future updates on the same account, and to reinstall it on your device. An account works on one device; after purchase it can be moved to a new device, and the old device is then removed and cannot sign in to that account again. You can delete your account in the app or at <a href="/delete-account">/delete-account</a> (Google / Apple accounts: send a request there and we delete it within 7 days). Contact: ${CONTACT}</p></div>`);
 
 const DELETE_PAGE = page('حذف الحساب — تشطيباتى', `<h1>حذف حساب تشطيباتى</h1><p class="muted">يحذف الحساب وحالة الشراء والأجهزة المسجلة نهائيًا. بيانات المشاريع على جهازك وفي Google Drive لا تتأثر.</p>
 <form class="card" id="f"><p><label>اسم المستخدم<br><input name="username" autocomplete="username" required></label></p><p><label>كلمة المرور<br><input name="password" type="password" autocomplete="current-password" required></label></p>
 <button>حذف الحساب نهائيًا</button><p id="m" role="status"></p></form>
-<script>document.getElementById('f').onsubmit=async e=>{e.preventDefault();const f=new FormData(e.target);const r=await fetch('/delete-account',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(Object.fromEntries(f))});const j=await r.json();document.getElementById('m').textContent=j.ok?'تم حذف الحساب.':'اسم المستخدم أو كلمة المرور غير صحيحة.';};</script>`);
+<h2>دخلت بحساب Google أو Apple؟</h2><p class="muted">الأسرع: من داخل التطبيق ← الحساب ← حذف الحساب (فوري). أو أرسل طلب الحذف هنا: نتأكد أن الحساب لك عبر وسيلة التواصل التي تكتبها، ثم نحذفه خلال 7 أيام.</p>
+<form class="card" id="f2"><p><label>اسم المستخدم (يظهر في التطبيق ← الحساب)<br><input name="username" required></label></p><p><label>البريد أو رقم الهاتف للتواصل<br><input name="contact" required></label></p>
+<button>إرسال طلب الحذف</button><p id="m2" role="status"></p></form>
+<script>const post=(u,f)=>fetch(u,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(f)))}).then(r=>r.json()).catch(()=>({}));
+document.getElementById('f').onsubmit=async e=>{e.preventDefault();const j=await post('/delete-account',e.target);document.getElementById('m').textContent=j.ok?'تم حذف الحساب.':j.error==='tooMany'?'محاولات كثيرة، حاول لاحقًا.':'اسم المستخدم أو كلمة المرور غير صحيحة.';};
+document.getElementById('f2').onsubmit=async e=>{e.preventDefault();const j=await post('/delete-account/request',e.target);document.getElementById('m2').textContent=j.ok?'تم استلام طلبك. سنتواصل معك للتأكيد ثم نحذف الحساب.':'تعذر الإرسال، حاول لاحقًا.';};</script>`);
 
 const ADMIN_PAGE = page('إدارة تشطيباتى', `<h1>إدارة حسابات تشطيباتى</h1>
 <div class="card" id="tot">…</div>
@@ -509,14 +627,17 @@ loadT();$('#go').onclick=load;$('#q').onkeydown=e=>{if(e.key==='Enter')load();};
 
 // ---------- server ----------
 function send(res, status, body, type = 'application/json; charset=utf-8', extra = {}) {
-  res.writeHead(status, { 'content-type': type, 'cache-control': 'no-store', 'access-control-allow-origin': '*', 'access-control-allow-headers': 'authorization, content-type',
-    'access-control-allow-methods': 'GET, POST, OPTIONS', 'x-content-type-options': 'nosniff', ...extra });
+  const site = res.isAdmin ? { 'x-frame-options': 'DENY', 'content-security-policy': "frame-ancestors 'none'", 'referrer-policy': 'no-referrer' }
+    : { 'access-control-allow-origin': '*', 'access-control-allow-headers': 'authorization, content-type', 'access-control-allow-methods': 'GET, POST, OPTIONS', 'x-frame-options': 'SAMEORIGIN' };
+  res.writeHead(status, { 'content-type': type, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'strict-transport-security': 'max-age=31536000', ...site, ...extra });
   res.end(typeof body === 'string' ? body : JSON.stringify(body));
 }
 const server = http.createServer(async (req, res) => {
-  req.ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
-  if (ipDiag < 40 && /^\/(api\/config|health)/.test(req.url)) { ipDiag++; console.log('ipdiag', JSON.stringify({ xff: req.headers['x-forwarded-for'], tci: req.headers['true-client-ip'], cf: req.headers['cf-connecting-ip'], xr: req.headers['x-real-ip'], remote: req.socket.remoteAddress, url: req.url })); }
+  req.ip = clientIp(req);
   const url = new URL(req.url, 'http://x');
+  res.isAdmin = url.pathname.startsWith('/admin');
+  // shows (in the server log) which forwarding headers Render passes, for the first requests after each start; no addresses are kept
+  if (ipDiag < 5 && url.pathname.startsWith('/api/')) { ipDiag++; const h = req.headers; console.log('ipcheck', JSON.stringify({ tci: !!h['true-client-ip'], cf: !!h['cf-connecting-ip'], xffParts: String(h['x-forwarded-for'] || '').split(',').filter(Boolean).length, sameAsTci: !!h['true-client-ip'] && String(h['x-forwarded-for'] || '').includes(h['true-client-ip']) })); }
   if (req.method === 'OPTIONS') return send(res, 204, '');
   try {
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/privacy')) return send(res, 200, PRIVACY, 'text/html; charset=utf-8');
@@ -554,8 +675,9 @@ async function seedTestUser() {
 }
 async function connectDb() {
   if (!process.env.DATABASE_URL) { console.error('DATABASE_URL is not set: add the database Internal URL in the service environment'); return setTimeout(connectDb, 30000); }
-  try { await migrate(); await seedTestUser(); dbReady = true; console.log('database ready'); } catch (e) { console.error('database not ready:', e.message); setTimeout(connectDb, 10000); }
+  try { await migrate(); await seedTestUser(); dbReady = true; console.log('database ready'); setTimeout(checkVoided, 60e3); } catch (e) { console.error('database not ready:', e.message); setTimeout(connectDb, 10000); }
 }
+setInterval(() => { if (dbReady) q(`delete from sessions where last_seen < now() - ($1 || ' days')::interval`, [String(SESSION_DAYS)]).catch(() => {}); }, 3600e3).unref();
 if (require.main === module) { server.listen(PORT, () => console.log('tashtibati server on', PORT)); connectDb(); }
 else dbReady = true;
-module.exports = { server, migrate, pool };
+module.exports = { server, migrate, pool, checkVoided };
