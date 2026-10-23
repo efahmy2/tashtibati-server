@@ -893,6 +893,15 @@ const PRIVACY = page('سياسة الخصوصية وشروط الاستخدام 
 <p>The full version is a one-time Google Play purchase and includes the right to download the app and all its future updates on the same account, and to reinstall it on your device. An account works on one device; after purchase it can be moved to a new device, and the old device is then removed and cannot sign in to that account again. You can delete your account in the app or at <a href="/delete-account">/delete-account</a> (Google / Apple accounts: send a request there and we delete it within 7 days). Contact: ${CONTACT}</p></div>`);
 
 const TERMS_PAGE = termsHtml();
+const htmlEsc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const SUPPORT_PAGE = page('الدعم — تشطيباتى · Tashtibati Support', `<h1>الدعم الفني — تشطيباتى</h1>
+<div class="card"><p>للمساعدة أو الاستفسار أو الإبلاغ عن مشكلة راسلنا على <a href="mailto:${SUPPORT_EMAIL}">${SUPPORT_EMAIL}</a> ونرد عادةً خلال يومي عمل. داخل التطبيق: زر الحساب ← «المساعدة».</p>
+<p dir="ltr" style="text-align:left">For help, questions or to report a problem, email <a href="mailto:${SUPPORT_EMAIL}">${SUPPORT_EMAIL}</a>. We usually reply within two working days. In the app: Account → Help.</p>
+<p><a href="/terms">الشروط والأحكام · Terms</a> &nbsp;·&nbsp; <a href="/privacy">سياسة الخصوصية · Privacy</a> &nbsp;·&nbsp; <a href="/delete-account">حذف الحساب · Delete account</a></p></div>
+<h2>أسئلة شائعة</h2>${HELP.map(h => `<div class="card"><b>${htmlEsc(h.ar.t)}</b><p>${htmlEsc(h.ar.b)}</p></div>`).join('')}
+<h2 dir="ltr" style="text-align:left">Frequently asked questions</h2>${HELP.map(h => `<div class="card" dir="ltr" style="text-align:left"><b>${htmlEsc(h.en.t)}</b><p>${htmlEsc(h.en.b)}</p></div>`).join('')}
+<p class="muted">© ${new Date().getFullYear()} Ehab Ahmed Abdel Hamid Fahmy · ايهاب احمد عبد الحميد فهمى</p>`);
+
 const DELETE_PAGE = page('حذف الحساب — تشطيباتى', `<h1>حذف حساب تشطيباتى</h1><p class="muted">يحذف الحساب وحالة الشراء والأجهزة المسجلة نهائيًا. بيانات المشاريع على جهازك وفي Google Drive لا تتأثر.</p>
 <form class="card" id="f"><p><label>اسم المستخدم<br><input name="username" autocomplete="username" required></label></p><p><label>كلمة المرور<br><input name="password" type="password" autocomplete="current-password" required></label></p>
 <button>حذف الحساب نهائيًا</button><p id="m" role="status"></p></form>
@@ -947,6 +956,7 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/privacy')) return send(res, 200, PRIVACY, 'text/html; charset=utf-8');
     if (req.method === 'GET' && url.pathname === '/delete-account') return send(res, 200, DELETE_PAGE, 'text/html; charset=utf-8');
+    if (req.method === 'GET' && url.pathname === '/support') return send(res, 200, SUPPORT_PAGE, 'text/html; charset=utf-8');
     if (req.method === 'GET' && url.pathname === '/terms') return send(res, 200, TERMS_PAGE, 'text/html; charset=utf-8');
     if (req.method === 'GET' && url.pathname === '/admin') { adminAuth(req); return send(res, 200, ADMIN_PAGE, 'text/html; charset=utf-8'); }
     const h = routes[`${req.method} ${url.pathname}`];
