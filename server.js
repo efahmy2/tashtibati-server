@@ -21,6 +21,7 @@ const AI_KEY = process.env.ANTHROPIC_API_KEY || '';
 const AI_MODEL = process.env.SUPPORT_MODEL || 'claude-haiku-5-5';
 const PLAN_MODEL = process.env.PLAN_MODEL || 'claude-sonnet-5-5';     // reads room names and sizes from plan photos
 const HELP = require('./help.js');
+const TERMS = require('./terms.js');      // terms and conditions; the app carries the same file
 const LATEST_VERSION = process.env.LATEST_VERSION || '';           // newest app version, e.g. 2.2.0
 const AI_DAILY_CAP = +process.env.AI_DAILY_CAP || 1500;            // cost guard: AI calls per day for the whole app
 const SESSION_DAYS = +process.env.SESSION_DAYS || 90;              // a sign-in unused this long expires
@@ -87,6 +88,8 @@ async function migrate() {
     alter table accounts add column if not exists pending_phone text;
     alter table accounts add column if not exists phone_channel text not null default 'sms';
     alter table accounts add column if not exists twofa boolean not null default false;
+    alter table accounts add column if not exists terms_version text;
+    alter table accounts add column if not exists terms_at timestamptz;
     update accounts set email_verified=true where not email_verified and email is not null and (google_sub is not null or apple_sub is not null);
     create table if not exists verify_codes (
       id serial primary key, account_id int not null references accounts(id) on delete cascade, purpose text not null, target text not null,
@@ -144,7 +147,7 @@ async function statusPayload(acc, deviceRow) {
     updates: stateOf(acc) === 'paid', latestVersion: LATEST_VERSION, updateUrl: UPDATE_URL, updateUrlIos: IOS_UPDATE_URL,
     devices: devs.map(d => ({ kind: d.kind, model: d.model, lastSeen: d.last_seen, current: d.id === deviceRow })),
     emailVerified: !!acc.email_verified, phone: acc.phone_verified ? acc.phone : '', phoneVerified: !!acc.phone_verified, phoneChannel: acc.phone_channel || 'sms', twofa: !!(acc.twofa && acc.phone_verified),
-    offline: offlinePass(acc, cur && cur.device_id) };
+    offline: offlinePass(acc, cur && cur.device_id), termsVersion: TERMS.version, termsAccepted: acc.terms_version === TERMS.version };
 }
 function readDevice(b) {
   const id = String(b.deviceId || '').slice(0, 128);
@@ -247,6 +250,20 @@ async function verifyPlay(token, productId) {
     await fetch(url + ':acknowledge', { method: 'POST', headers: { authorization: 'Bearer ' + at, 'content-type': 'application/json' }, body: '{}' }).catch(() => {});
   }
   return { configured: true, data: j };
+}
+
+// ---------- terms and conditions: each account's accepted version and time ----------
+async function noteTerms(acc, b) {
+  if (b && b.termsAccepted === TERMS.version && acc.terms_version !== TERMS.version) {
+    await q('update accounts set terms_version=$2, terms_at=now() where id=$1', [acc.id, TERMS.version]);
+    acc.terms_version = TERMS.version;
+  }
+}
+function termsHtml() {
+  const part = (L, dir) => `<section dir="${dir}" style="text-align:${dir === 'rtl' ? 'right' : 'left'}"><h1>${L.title}</h1>
+    <p class="muted">${dir === 'rtl' ? 'الإصدار' : 'Version'} ${TERMS.version} · ${dir === 'rtl' ? 'تاريخ السريان' : 'Effective'} ${TERMS.effective} · ${L.note}</p>
+    ${L.clauses.map(([t, b, list, after]) => `<h2>${t}</h2>${b ? `<p>${b}</p>` : ''}${list ? `<ol>${list.map(x => `<li>${x}</li>`).join('')}</ol>` : ''}${after ? `<p>${after}</p>` : ''}`).join('')}</section>`;
+  return page('الشروط والأحكام — تشطيباتى', part(TERMS.ar, 'rtl') + '<hr>' + part(TERMS.en, 'ltr') + `<p><a href="/privacy">سياسة الخصوصية · Privacy policy</a></p>`);
 }
 
 // ---------- offline pass, email / SMS codes, two-step sign-in ----------
@@ -359,6 +376,12 @@ function verifyAppleJws(jws) {
   if (!ok) throw new HttpErr(400, 'badPurchase');
   return JSON.parse(Buffer.from(parts[1], 'base64url'));
 }
+// a purchase made for an account that was later deleted may be restored to the user's new account
+async function accountExists(publicId) {
+  if (!/^[0-9a-f-]{36}$/i.test(String(publicId))) return false;
+  const [a] = await q('select 1 from accounts where public_id=$1', [String(publicId).toLowerCase()]);
+  return !!a;
+}
 const looksLikeJws = t => /^eyJ[\w-]+\.[\w-]+\.[\w-]+$/.test(t);
 async function appleRefund(originalTransactionId, info) {
   const rows = await q(`update purchases set state='voided', detail=coalesce(detail,'{}'::jsonb) || $2::jsonb where token=$1 and state<>'voided' returning account_id`, ['apple:' + originalTransactionId, JSON.stringify({ voided: info })]);
@@ -429,7 +452,7 @@ const markIntegrity = (row, v) => v ? q('update devices set integrity=$2 where i
 // ---------- API ----------
 const routes = {
   'GET /health': async () => ({ ok: true, db: dbReady }),
-  'GET /api/config': async () => ({ ok: true, productId: PRODUCT_ID, trialDays: TRIAL_DAYS, googleClientId: GOOGLE_CLIENT_ID, apple: !!APPLE_CLIENT_ID, support: SUPPORT_EMAIL, ai: !!AI_KEY, latestVersion: LATEST_VERSION, updateUrl: UPDATE_URL, integrity: integrityOn(), integrityProject: INTEGRITY_PROJECT, mail: mailOn(), sms: smsOn(), whatsapp: smsOn() && WA_ON, offlineDays: OFFLINE_KEY ? OFFLINE_DAYS : 0 }),
+  'GET /api/config': async () => ({ ok: true, productId: PRODUCT_ID, trialDays: TRIAL_DAYS, googleClientId: GOOGLE_CLIENT_ID, apple: !!APPLE_CLIENT_ID, support: SUPPORT_EMAIL, ai: !!AI_KEY, termsVersion: TERMS.version, latestVersion: LATEST_VERSION, updateUrl: UPDATE_URL, integrity: integrityOn(), integrityProject: INTEGRITY_PROJECT, mail: mailOn(), sms: smsOn(), whatsapp: smsOn() && WA_ON, offlineDays: OFFLINE_KEY ? OFFLINE_DAYS : 0 }),
   'POST /api/nonce': async (req) => { limit('nonce:' + req.ip, 60, 600e3); const n = crypto.randomBytes(24).toString('base64url'); nonces.set(n, { at: Date.now() }); return { ok: true, nonce: n }; },
 
   // Sign in with Google: the app sends the Google ID token; Google confirms it; first sign-in creates the account
@@ -444,6 +467,7 @@ const routes = {
     const { acc, created, usedTrial } = await socialAccount('google', g.sub, g.email_verified === 'true' || g.email_verified === true ? g.email : null, g.name || b.name || '', dev);
     const passed = await twoStep(acc, dev, b);
     const row = await attachDevice(acc, dev, !!b.transfer); await markIntegrity(row, integ); if (passed) otpPassed.delete(passed);   // a code is good for one sign-in only
+    await noteTerms(acc, b);
     return { ...(await statusPayload(acc, row)), token: await newSession(acc, row), created, trialUsedOnDevice: usedTrial };
   },
 
@@ -478,6 +502,7 @@ const routes = {
     const { acc, created, usedTrial } = await socialAccount('apple', c.sub, c.email || null, String(b.name || '').slice(0, 80), dev);
     const passed = await twoStep(acc, dev, b);
     const row = await attachDevice(acc, dev, !!b.transfer); await markIntegrity(row, integ); if (passed) otpPassed.delete(passed);
+    await noteTerms(acc, b);
     return { ...(await statusPayload(acc, row)), token: await newSession(acc, row), created, trialUsedOnDevice: usedTrial };
   },
   // App Store Server Notifications (version 2): refunds and revoked purchases remove the full version
@@ -501,12 +526,21 @@ const routes = {
     const { acc, created, usedTrial } = await socialAccount('apple', p.identity.sub, p.identity.email, p.identity.name, p.dev);
     const passed = await twoStep(acc, p.dev, b);
     const row = await attachDevice(acc, p.dev, !!b.transfer); await markIntegrity(row, p.integ); if (passed) otpPassed.delete(passed);
+    await noteTerms(acc, b);
     applePending.delete(String(b.state));
     return { ...(await statusPayload(acc, row)), token: await newSession(acc, row), created, trialUsedOnDevice: usedTrial };
   },
 
   // ---------- help and support ----------
   'GET /api/help': async () => ({ ok: true, articles: HELP, email: SUPPORT_EMAIL }),
+  'GET /api/terms': async () => ({ ok: true, terms: TERMS }),
+  'POST /api/terms/accept': async (req, b) => {
+    const s = await auth(req);
+    if (b.version !== TERMS.version) throw new HttpErr(409, 'termsOutdated', { version: TERMS.version });
+    await q('update accounts set terms_version=$2, terms_at=now() where id=$1', [s.id, TERMS.version]);
+    const [acc] = await q('select * from accounts where id=$1', [s.id]);
+    return statusPayload(acc, s.device_row);
+  },
   'POST /api/support': async (req, b) => {
     limit('ai:' + req.ip, 40, 3600e3);
     let who = null; try { who = await auth(req); } catch (e) {}
@@ -675,6 +709,7 @@ Include every labelled room or space. Only give numbers you can actually read �
     const username = normUser(b.username), pw = String(b.password || '');
     if (!validUser(username)) throw new HttpErr(400, 'badUsername');
     if (pw.length < 8 || pw.length > 128) throw new HttpErr(400, 'weakPassword');
+    if (b.termsAccepted !== TERMS.version) throw new HttpErr(400, 'termsRequired');
     const dev = readDevice(b);
     limit('regdev:' + dev.id, 5, 864e5); limit('regall', 300, 3600e3);
     const integ = await checkIntegrity(b, 'register');
@@ -682,7 +717,7 @@ Include every labelled room or space. Only give numbers you can actually read �
     if (exists) throw new HttpErr(409, 'usernameTaken');
     const [usedTrial] = await q('select 1 from trial_devices where device_id=$1', [dev.id]);
     const trialEnds = usedTrial ? new Date() : new Date(Date.now() + TRIAL_DAYS * 864e5);
-    const [acc] = await q('insert into accounts(public_id, username, pass_hash, trial_ends) values($1,$2,$3,$4) returning *', [crypto.randomUUID(), username, hashPassword(pw), trialEnds]);
+    const [acc] = await q('insert into accounts(public_id, username, pass_hash, trial_ends, terms_version, terms_at) values($1,$2,$3,$4,$5,now()) returning *', [crypto.randomUUID(), username, hashPassword(pw), trialEnds, TERMS.version]);
     if (!usedTrial) await q('insert into trial_devices(device_id, account_id) values($1,$2) on conflict do nothing', [dev.id, acc.id]);
     const row = await attachDevice(acc, dev, false); await markIntegrity(row, integ);
     return { ...(await statusPayload(acc, row)), token: await newSession(acc, row), trialUsedOnDevice: !!usedTrial };
@@ -696,6 +731,7 @@ Include every labelled room or space. Only give numbers you can actually read �
     const dev = readDevice(b), integ = await checkIntegrity(b, 'login');
     const passed = await twoStep(acc, dev, b);
     const row = await attachDevice(acc, dev, !!b.transfer); await markIntegrity(row, integ); if (passed) otpPassed.delete(passed);   // a code is good for one sign-in only
+    await noteTerms(acc, b);
     hits.delete('user:' + username);
     return { ...(await statusPayload(acc, row)), token: await newSession(acc, row) };
   },
@@ -713,7 +749,7 @@ Include every labelled room or space. Only give numbers you can actually read �
       if (prev && prev.account_id && prev.account_id !== s.id) throw new HttpErr(409, 'purchaseOtherAccount');
       let state = 'purchased';
       if (t.bundleId !== IOS_BUNDLE_ID || t.productId !== PRODUCT_ID) state = 'error';
-      else if (t.appAccountToken && String(t.appAccountToken).toLowerCase() !== String(s.public_id).toLowerCase()) state = 'wrongAccount';
+      else if (t.appAccountToken && String(t.appAccountToken).toLowerCase() !== String(s.public_id).toLowerCase() && await accountExists(t.appAccountToken)) state = 'wrongAccount';
       else if (t.revocationDate) state = 'cancelled';
       await q(`insert into purchases(account_id, token, order_id, product_id, state, detail) values($1,$2,$3,$4,$5,$6)
                on conflict (token) do update set state=excluded.state, detail=excluded.detail, account_id=excluded.account_id`,
@@ -728,7 +764,7 @@ Include every labelled room or space. Only give numbers you can actually read �
     let state = 'review';
     if (v.configured && v.data) {
       const d = v.data;
-      if (d.obfuscatedExternalAccountId && d.obfuscatedExternalAccountId !== s.public_id) state = 'wrongAccount';
+      if (d.obfuscatedExternalAccountId && d.obfuscatedExternalAccountId !== s.public_id && await accountExists(d.obfuscatedExternalAccountId)) state = 'wrongAccount';
       else state = d.purchaseState === 0 ? 'purchased' : d.purchaseState === 2 ? 'pending' : 'cancelled';
     } else if (v.configured && v.error) state = 'error';
     await q(`insert into purchases(account_id, token, order_id, product_id, state, detail) values($1,$2,$3,$4,$5,$6)
@@ -768,7 +804,7 @@ Include every labelled room or space. Only give numbers you can actually read �
     const term = '%' + (url.searchParams.get('q') || '').toLowerCase() + '%';
     const rows = await q(`select a.id, a.username, a.email, a.google_sub is not null as google, a.created_at, a.trial_ends, a.paid, a.paid_at, a.paid_via, a.note,
         (select json_agg(json_build_object('id', d.id, 'kind', d.kind, 'model', d.model, 'lastSeen', d.last_seen)) from devices d where d.account_id=a.id and d.active) as devices,
-        (select count(*)::int from devices d where d.account_id=a.id and d.revoked) as blocked, a.apple_sub is not null as apple, a.email_verified, a.phone, a.phone_verified, a.twofa,
+        (select count(*)::int from devices d where d.account_id=a.id and d.revoked) as blocked, a.apple_sub is not null as apple, a.email_verified, a.phone, a.phone_verified, a.twofa, a.terms_version, a.terms_at,
         (select json_agg(json_build_object('order', p.order_id, 'state', p.state, 'at', p.created_at)) from purchases p where p.account_id=a.id) as purchases
       from accounts a where a.username like $1 order by a.created_at desc limit 300`, [term]);
     const [tot] = await q(`select count(*)::int as all, count(*) filter (where paid)::int as paid, count(*) filter (where not paid and trial_ends>now())::int as trial from accounts`);
@@ -846,6 +882,7 @@ const PRIVACY = page('سياسة الخصوصية وشروط الاستخدام 
 <h2>المساعدة والدعم</h2><p>أسئلتك للمساعد الذكي داخل التطبيق (بعد تسجيل الدخول) تُرسل إلى خادمنا ومزوّد الذكاء الاصطناعي (Anthropic) لتوليد الرد فقط، ولا تُستخدم لأي غرض آخر. الطلبات المحوّلة للدعم تُحفظ لدينا مع اسم المستخدم لمتابعتها، وتُرسل بالبريد إلى ${SUPPORT_EMAIL}.</p>
 <h2>الشراء والتحديثات</h2><p>النسخة الكاملة شراء لمرة واحدة عبر Google Play، وتشمل حق تنزيل التطبيق وجميع تحديثاته المستقبلية لنفس الحساب، وإعادة تثبيته على جهازك. الحساب يعمل على جهاز واحد، ويمكن نقله لجهاز جديد بعد الشراء، وعندها يُزال الجهاز القديم ولا يمكنه الدخول لهذا الحساب مرة أخرى. الفترة التجريبية مرة واحدة لكل جهاز. إذا استُرد مبلغ الشراء من Google Play يعود الحساب إلى النسخة المنتهية.</p>
 <h2>حذف الحساب</h2><p>يمكنك حذف حسابك من داخل التطبيق (الحساب ← حذف الحساب) أو من <a href="/delete-account">صفحة حذف الحساب</a> (لحسابات Google وApple تُرسل طلبًا ونحذفه خلال 7 أيام). يُحذف الحساب وبيانات الأجهزة والجلسات فورًا. بيانات مشاريعك على جهازك ونسخك الاحتياطية تبقى ملكك وتحت تحكمك.</p>
+<h2>الشروط والأحكام</h2><p>استخدام التطبيق يخضع <a href="/terms">للشروط والأحكام</a>.</p>
 <h2>التواصل</h2><p>${CONTACT}</p>
 <hr><h1 dir="ltr" style="text-align:left">Privacy policy and terms — Tashtibati</h1><div dir="ltr" style="text-align:left">
 <p>Our server stores your username and a hashed password (or your Google / Apple account id, email and name when you sign in with them), trial dates, Google Play purchase details, and the id, type and model of your device, to apply the one-device-per-account rule and to give each device only one free trial. Project data stays on your device; backups go where you choose: a "Tashtibati" folder in your own Google Drive, a file on your device that you can send to any cloud, or iCloud on the iPhone version. Project data is never sent to our server. WhatsApp notification reading (only with your consent) happens on the device.</p>
@@ -855,6 +892,7 @@ const PRIVACY = page('سياسة الخصوصية وشروط الاستخدام 
 <p>Questions to the in-app support assistant (when signed in) are sent to our server and our AI provider (Anthropic) only to produce the reply. Issues passed to support are stored with your username and emailed to ${SUPPORT_EMAIL}.</p>
 <p>The full version is a one-time Google Play purchase and includes the right to download the app and all its future updates on the same account, and to reinstall it on your device. An account works on one device; after purchase it can be moved to a new device, and the old device is then removed and cannot sign in to that account again. You can delete your account in the app or at <a href="/delete-account">/delete-account</a> (Google / Apple accounts: send a request there and we delete it within 7 days). Contact: ${CONTACT}</p></div>`);
 
+const TERMS_PAGE = termsHtml();
 const DELETE_PAGE = page('حذف الحساب — تشطيباتى', `<h1>حذف حساب تشطيباتى</h1><p class="muted">يحذف الحساب وحالة الشراء والأجهزة المسجلة نهائيًا. بيانات المشاريع على جهازك وفي Google Drive لا تتأثر.</p>
 <form class="card" id="f"><p><label>اسم المستخدم<br><input name="username" autocomplete="username" required></label></p><p><label>كلمة المرور<br><input name="password" type="password" autocomplete="current-password" required></label></p>
 <button>حذف الحساب نهائيًا</button><p id="m" role="status"></p></form>
@@ -876,7 +914,7 @@ const d=x=>x?new Date(x).toLocaleString('ar-EG-u-nu-latn',{dateStyle:'medium',ti
 const st={paid:'مدفوع',trial:'تجريبي',expired:'انتهت التجربة'};
 async function load(){const r=await fetch('/admin/api/accounts?q='+encodeURIComponent($('#q').value));const j=await r.json();
  $('#tot').innerHTML='الحسابات: <b>'+j.totals.all+'</b> · مدفوع: <b>'+j.totals.paid+'</b> · في التجربة: <b>'+j.totals.trial+'</b>';
- $('#rows').innerHTML=j.accounts.map(a=>'<tr><td><b>'+esc(a.username)+'</b>'+(a.google?' <span class="pill trial">Google</span>':'')+(a.apple?' <span class="pill trial">Apple</span>':'')+(a.email?'<br><span class="muted">'+esc(a.email)+(a.email_verified?' ✓':'')+'</span>':'')+(a.phone?'<br><span class="muted" dir="ltr">'+esc(a.phone)+(a.phone_verified?' ✓':'')+'</span>':'')+(a.twofa?' <span class="pill paid">2FA</span>':'')+'<br><span class="muted">'+d(a.created_at)+'</span>'+(a.note?'<br><span class="muted">'+esc(a.note)+'</span>':'')+'</td>'+
+ $('#rows').innerHTML=j.accounts.map(a=>'<tr><td><b>'+esc(a.username)+'</b>'+(a.google?' <span class="pill trial">Google</span>':'')+(a.apple?' <span class="pill trial">Apple</span>':'')+(a.email?'<br><span class="muted">'+esc(a.email)+(a.email_verified?' ✓':'')+'</span>':'')+(a.phone?'<br><span class="muted" dir="ltr">'+esc(a.phone)+(a.phone_verified?' ✓':'')+'</span>':'')+(a.twofa?' <span class="pill paid">2FA</span>':'')+'<br><span class="muted">'+(a.terms_version?'الشروط '+esc(a.terms_version)+' · '+d(a.terms_at):'لم يوافق على الشروط بعد')+'</span>'+'<br><span class="muted">'+d(a.created_at)+'</span>'+(a.note?'<br><span class="muted">'+esc(a.note)+'</span>':'')+'</td>'+
  '<td><span class="pill '+a.state+'">'+st[a.state]+'</span><br><span class="muted">'+(a.paid?('منذ '+d(a.paid_at)+' · '+esc(a.paid_via||'')):('حتى '+d(a.trial_ends)))+'</span></td>'+
  '<td>'+((a.devices||[]).map(x=>esc(x.kind==='tablet'?'تابلت':'هاتف')+' '+esc(x.model)+' <button class="ghost" data-a="removeDevice" data-id="'+a.id+'" data-dev="'+x.id+'">إزالة</button><br><span class="muted">'+d(x.lastSeen)+'</span>').join('<br>')||'—')+'</td>'+
  '<td>'+((a.purchases||[]).map(p=>esc(p.order||'')+' <b>'+esc(p.state)+'</b>').join('<br>')||'—')+'</td>'+
@@ -909,6 +947,7 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/privacy')) return send(res, 200, PRIVACY, 'text/html; charset=utf-8');
     if (req.method === 'GET' && url.pathname === '/delete-account') return send(res, 200, DELETE_PAGE, 'text/html; charset=utf-8');
+    if (req.method === 'GET' && url.pathname === '/terms') return send(res, 200, TERMS_PAGE, 'text/html; charset=utf-8');
     if (req.method === 'GET' && url.pathname === '/admin') { adminAuth(req); return send(res, 200, ADMIN_PAGE, 'text/html; charset=utf-8'); }
     const h = routes[`${req.method} ${url.pathname}`];
     if (h && !dbReady && url.pathname !== '/health') throw new HttpErr(503, 'starting');
