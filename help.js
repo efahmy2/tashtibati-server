@@ -47,6 +47,6 @@ module.exports = [
     en: { t: 'Permissions (notifications, location)', b: 'The “Permissions” page on the home screen: consent to reading WhatsApp notifications (auto version) for transfers and team messages, and location to save a project’s site. Each one needs your consent and can be withdrawn.' } },
   { id: 'delete', ar: { t: 'حذف الحساب والخصوصية', b: 'الحساب ← حذف الحساب. يُحذف الحساب وبيانات الأجهزة والشراء من خادمنا. بيانات مشاريعك على جهازك وفي Google Drive تبقى ملكك. سياسة الخصوصية من صفحة الدخول أو الحساب.' },
     en: { t: 'Deleting your account and privacy', b: 'Account → Delete account. The account, devices and purchase records are deleted from our server. Your project data on your device and in Google Drive stays yours. The privacy policy is linked on the sign-in and account pages.' } },
-  { id: 'contact', ar: { t: 'التواصل مع الدعم', b: 'من «المساعدة» اسأل المساعد الذكي أولًا. إذا لم تُحل المشكلة اضغط «إرسال للدعم» فتُرسل التفاصيل بالبريد إلى tastibatiapp@gmail.com.' },
-    en: { t: 'Contacting support', b: 'In “Help”, ask the assistant first. If that does not solve it, tap “Send to support” and the details go by email to tastibatiapp@gmail.com.' } },
+  { id: 'contact', ar: { t: 'التواصل مع الدعم', b: 'من «المساعدة» اسأل المساعد الذكي أولًا. إذا لم تُحل المشكلة اضغط «إرسال للدعم» فتُرسل التفاصيل بالبريد إلى tashtibatiapp@gmail.com.' },
+    en: { t: 'Contacting support', b: 'In “Help”, ask the assistant first. If that does not solve it, tap “Send to support” and the details go by email to tashtibatiapp@gmail.com.' } },
 ];
