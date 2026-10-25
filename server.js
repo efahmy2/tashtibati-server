@@ -21,6 +21,8 @@ const AI_KEY = process.env.ANTHROPIC_API_KEY || '';
 const AI_MODEL = process.env.SUPPORT_MODEL || 'claude-haiku-5-5';
 const PLAN_MODEL = process.env.PLAN_MODEL || 'claude-sonnet-5-5';     // reads room names and sizes from plan photos
 const HELP = require('./help.js');
+const SITE = require('./site.js');
+const SITE_URL = (process.env.SITE_URL || 'https://tashtibati.com').replace(/\/$/, '');
 const TERMS = require('./terms.js');      // terms and conditions; the app carries the same file
 const LATEST_VERSION = process.env.LATEST_VERSION || '';           // newest app version, e.g. 2.2.0
 const AI_DAILY_CAP = +process.env.AI_DAILY_CAP || 1500;            // cost guard: AI calls per day for the whole app
@@ -954,7 +956,8 @@ const server = http.createServer(async (req, res) => {
   if (ipDiag < 5 && url.pathname.startsWith('/api/')) { ipDiag++; const h = req.headers; console.log('ipcheck', JSON.stringify({ tci: !!h['true-client-ip'], cf: !!h['cf-connecting-ip'], xffParts: String(h['x-forwarded-for'] || '').split(',').filter(Boolean).length, sameAsTci: !!h['true-client-ip'] && String(h['x-forwarded-for'] || '').includes(h['true-client-ip']) })); }
   if (req.method === 'OPTIONS') return send(res, 204, '');
   try {
-    if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/privacy')) return send(res, 200, PRIVACY, 'text/html; charset=utf-8');
+    if (SITE.handle(req, res, url, send, { base: SITE_URL, playUrl: process.env.STORE_PLAY_URL || '', iosUrl: process.env.STORE_IOS_URL || '', email: CONTACT })) return;
+    if (req.method === 'GET' && url.pathname === '/privacy') return send(res, 200, PRIVACY, 'text/html; charset=utf-8');
     if (req.method === 'GET' && url.pathname === '/delete-account') return send(res, 200, DELETE_PAGE, 'text/html; charset=utf-8');
     if (req.method === 'GET' && url.pathname === '/support') return send(res, 200, SUPPORT_PAGE, 'text/html; charset=utf-8');
     if (req.method === 'GET' && url.pathname === '/terms') return send(res, 200, TERMS_PAGE, 'text/html; charset=utf-8');
