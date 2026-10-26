@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 const DIR = path.join(__dirname, 'site');
-const TYPES = { '.webp': 'image/webp', '.png': 'image/png', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml' };
+const TYPES = { '.webp': 'image/webp', '.png': 'image/png', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml', '.mp4': 'video/mp4' };
 const FILES = {};
 for (const f of fs.existsSync(DIR) ? fs.readdirSync(DIR) : []) {
   const t = TYPES[path.extname(f)]; if (t) FILES[f] = { type: t, body: fs.readFileSync(path.join(DIR, f)) };
@@ -19,6 +19,7 @@ const T = {
     lead: 'من أول تحويل من العميل حتى التسليم: الرصيد، والمصروفات، وأتعابك، واتفاقات المقاولين ومقاسات الغرف — في مكان واحد، على موبايلك.',
     play: 'احصل عليه من', playStore: 'Google Play', ios: 'حمّله من', iosStore: 'App Store', soon: 'قريبًا',
     trial: 'جرّب كل المزايا مجانًا ٧ أيام',
+    videoTitle: 'يوم في حياة مهندس تشطيبات… قبل تشطيباتى وبعده', videoNote: 'فيديو قصير ٤٧ ثانية',
     featTitle: 'كل ما تحتاجه لإدارة حسابات الموقع',
     feats: [
       ['رصيد العهدة لحظة بلحظة', 'الوارد من العميل، والمنصرف، والمتبقي، وأتعابك محسوبة تلقائيًا: نسبة من المصروفات، أو مبلغ مقطوع، أو بالمتر.'],
@@ -44,6 +45,7 @@ const T = {
     lead: 'From the client’s first transfer to handover: balance, expenses, your fee, contractor agreements and room sizes — in one place, on your phone.',
     play: 'Get it on', playStore: 'Google Play', ios: 'Download on the', iosStore: 'App Store', soon: 'Coming soon',
     trial: 'Try every feature free for 7 days',
+    videoTitle: 'A day in the life of a finishing engineer — before Tashtibati, and after', videoNote: 'A 47-second story',
     featTitle: 'Everything you need to run site accounts',
     feats: [
       ['Site cash, always up to date', 'Money in from the client, money spent, what’s left, and your fee calculated for you: a percentage, a lump sum, or per square metre.'],
@@ -108,6 +110,9 @@ a{color:inherit}img{max-width:100%;height:auto;display:block}
 section{padding:72px 0}h2{font-size:clamp(26px,3.4vw,36px);line-height:1.25;margin-bottom:28px}
 .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
 .feat{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:24px}
+.video{margin:0 auto;max-width:1000px;border-radius:22px;overflow:hidden;background:#0b0f0d;box-shadow:0 30px 70px rgba(13,44,85,.25);aspect-ratio:16/9}
+.video video{display:block;width:100%;height:100%;object-fit:cover}
+.vnote{text-align:center;color:var(--muted);font-size:15px;margin-top:12px}
 .feat svg{width:40px;height:40px;padding:8px;border-radius:12px;background:#eaf0f8;stroke:var(--blue);fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;margin-bottom:12px}
 .feat h3{font-size:19px;margin-bottom:6px}.feat p{color:var(--muted);font-size:16px}
 .shots{display:flex;gap:18px;overflow-x:auto;padding-bottom:10px;scroll-snap-type:x mandatory}
@@ -132,7 +137,12 @@ footer nav{display:flex;flex-wrap:wrap;gap:10px 22px}footer a{text-decoration:no
   <div class="devices" aria-hidden="true"><div class="phone p1"><img src="/site/${lang}-home.webp" alt="" width="420" height="909"></div><div class="phone p2"><img src="/site/${lang}-ledger.webp" alt="" width="420" height="909"></div></div>
 </div></div>
 <main>
-<section><div class="wrap"><h2>${esc(t.featTitle)}</h2><div class="grid">
+<section><div class="wrap"><h2 style="text-align:center">${esc(t.videoTitle)}</h2>
+  <div class="video"><video src="/site/story-${lang}.mp4" poster="/site/story-${lang}.jpg" controls playsinline muted loop preload="none" aria-label="${esc(t.videoTitle)}"></video></div>
+  <p class="vnote">${esc(t.videoNote)}</p>
+  <script>(function(){var v=document.querySelector('.video video');if(!v||!('IntersectionObserver' in window))return;if(matchMedia('(prefers-reduced-motion: reduce)').matches)return;new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting){v.play().catch(function(){})}else{v.pause()}})},{threshold:.5}).observe(v)})();</script>
+</div></section>
+<section style="padding-top:0"><div class="wrap"><h2>${esc(t.featTitle)}</h2><div class="grid">
 ${t.feats.map((f, i) => `<div class="feat"><svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[i]}</svg><h3>${esc(f[0])}</h3><p>${esc(f[1])}</p></div>`).join('')}
 </div></div></section>
 <section style="padding-top:0"><div class="wrap"><h2>${esc(t.shotsTitle)}</h2><div class="shots">
@@ -161,7 +171,16 @@ function handle(req, res, url, send, opts) {
   if (url.pathname.startsWith('/site/')) {
     const f = FILES[url.pathname.slice(6)];
     if (!f) return false;
-    res.writeHead(200, { 'content-type': f.type, 'cache-control': 'public, max-age=604800', 'x-content-type-options': 'nosniff', 'content-length': f.body.length });
+    const base = { 'content-type': f.type, 'cache-control': 'public, max-age=604800', 'x-content-type-options': 'nosniff', 'accept-ranges': 'bytes' };
+    const m = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || ''), n = f.body.length;
+    if (m && (m[1] || m[2])) {
+      let a = m[1] ? +m[1] : n - +m[2], b = m[1] && m[2] ? Math.min(+m[2], n - 1) : n - 1;
+      if (a < 0) a = 0;
+      if (a >= n || a > b) { res.writeHead(416, { ...base, 'content-range': `bytes */${n}` }); res.end(); return true; }
+      res.writeHead(206, { ...base, 'content-range': `bytes ${a}-${b}/${n}`, 'content-length': b - a + 1 });
+      res.end(req.method === 'HEAD' ? undefined : f.body.subarray(a, b + 1)); return true;
+    }
+    res.writeHead(200, { ...base, 'content-length': n });
     res.end(req.method === 'HEAD' ? undefined : f.body);
     return true;
   }
