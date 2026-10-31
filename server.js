@@ -608,11 +608,15 @@ ${kb}`;
     const types = 'bedroom, master, reception, living, dining, kitchen, bathroom, toilet, dressing, corridor, stairs, entrance, balcony, terrace, maid, laundry, storage, office, shop, hall, warehouse, production, parking, loading, yard, garden, pool, roof, other';
     const prompt = `This image is an architectural floor plan (a brochure page, a drawing, or a photo of one). Read it and return ONLY a JSON object, no other text:
 {"floor": "ground|first|second|third|fourth|fifth|roof|basement|mezzanine|null", "floorLabel": "heading as written or null", "floorArea": number or null, "totalArea": number or null,
- "spaces": [{"name": "label exactly as written", "nameAr": "Arabic name for it", "type": "one of: ${types}", "length": number or null, "width": number or null, "area": number or null}]}
+ "floors": [{"floor": "ground|first|...", "area": number or null}],
+ "spaces": [{"name": "label exactly as written", "nameAr": "Arabic name for it", "type": "one of: ${types}", "floor": "ground|first|second|third|fourth|fifth|roof|basement|mezzanine|null", "length": number or null, "width": number or null, "area": number or null}]}
 Rules: sizes are in metres; a label like "3.70m x 5.88m" means length 3.70 and width 5.88 (keep that order). "floorArea" is the floor's own area if written (e.g. "GROUND FLOOR AREA 107 M2"); "totalArea" is a total built-up area if written.
+The page may show several floors (e.g. a ground floor and a first floor, each with its own room list): give each space its own "floor" and list every floor with its written area in "floors"; "floor" at the top is the first one shown.
+Sizes may be written next to the room name, in a legend table (e.g. "4.0 x 4.9  ديوانية"), or on the dimension lines around the room (e.g. 3.30 along one wall and 3.00 along the other) — use whichever is written for that room.
+Labels are often Arabic: keep "name" exactly as written and put the same Arabic text in "nameAr".
 Include every labelled room or space. Only give numbers you can actually read — never estimate from the drawing scale; use null when a size is not written or not legible.`;
     const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': AI_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-      body: JSON.stringify({ model: PLAN_MODEL, max_tokens: 3000, messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: media, data } }, { type: 'text', text: prompt }] }] }) })
+      body: JSON.stringify({ model: PLAN_MODEL, max_tokens: 5000, messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: media, data } }, { type: 'text', text: prompt }] }] }) })
       .catch(() => { throw new HttpErr(502, 'aiUnreachable'); });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) { console.error('plan ai', r.status, j.error && j.error.message); throw new HttpErr(502, 'aiFailed'); }
@@ -620,8 +624,9 @@ Include every labelled room or space. Only give numbers you can actually read �
     let plan = null; try { plan = JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1)); } catch (e) {}
     if (!plan || !Array.isArray(plan.spaces)) throw new HttpErr(422, 'planUnreadable');
     const n = v => (typeof v === 'number' && isFinite(v) && v > 0 && v < 100000 ? Math.round(v * 100) / 100 : null);
-    plan.spaces = plan.spaces.slice(0, 120).map(x => ({ name: String(x.name || '').slice(0, 60), nameAr: String(x.nameAr || '').slice(0, 60), type: String(x.type || 'other').slice(0, 20), length: n(x.length), width: n(x.width), area: n(x.area) }));
-    return { ok: true, plan: { floor: plan.floor || null, floorLabel: plan.floorLabel || null, floorArea: n(plan.floorArea), totalArea: n(plan.totalArea), spaces: plan.spaces } };
+    plan.spaces = plan.spaces.slice(0, 120).map(x => ({ name: String(x.name || '').slice(0, 60), nameAr: String(x.nameAr || '').slice(0, 60), type: String(x.type || 'other').slice(0, 20), floor: x.floor ? String(x.floor).slice(0, 20) : null, length: n(x.length), width: n(x.width), area: n(x.area) }));
+    return { ok: true, plan: { floor: plan.floor || null, floorLabel: plan.floorLabel || null, floorArea: n(plan.floorArea), totalArea: n(plan.totalArea),
+      floors: (Array.isArray(plan.floors) ? plan.floors : []).slice(0, 12).map(f => ({ floor: String((f && f.floor) || '').slice(0, 20), area: n(f && f.area) })), spaces: plan.spaces } };
   },
 
   // ---------- email, mobile, two-step, password reset ----------
