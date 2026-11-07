@@ -1,7 +1,7 @@
 // Tashtibati terms and conditions — the same file is used by the app (shown and accepted in the app) and by the server (/terms page, version check).
 // Changing any clause: raise TERMS.version, so every user is asked to accept again.
 var TERMS = {
-  version: '1.1',
+  version: '1.2',
   effective: '2026-10-23',
   ar: {
     title: 'الشروط والأحكام — تطبيق تشطيباتى',
@@ -18,9 +18,9 @@ var TERMS = {
         'نسخ تصميم التطبيق أو شاشاته أو نصوصه أو قوالب تقاريره لعمل منتج منافس.',
         'استخدام التطبيق في أي عمل غير قانوني، أو إرهاق خادمه أو محاولة الدخول غير المصرح به إليه.'],
         'التقارير التي تصدّرها لمشاريعك (Excel وغيرها) ملك لك، ويجوز لك مشاركتها مع أطراف مشاريعك.'],
-      ['5. الحساب والجهاز', 'أنت مسؤول عن صحة بياناتك وسرية كلمة المرور وكل ما يتم من خلال حسابك. يعمل الحساب على جهاز واحد؛ ومع اشتراك فعّال أو شراء النسخة مدى الحياة يمكن نقله لجهاز جديد، فيُمنع الجهاز القديم من الدخول لهذا الحساب. الفترة التجريبية مرة واحدة لكل جهاز. يحتاج التطبيق للإنترنت للتحقق من الحساب، ويعمل بدونه مدة محدودة بعد آخر تحقق.'],
-      ['6. الفترة التجريبية والنسخة المجانية والاشتراكات والشراء', '', [
-        'الفترة التجريبية 7 أيام بكل المزايا، مرة واحدة لكل حساب وجهاز. بعدها 14 يومًا مجانية مرة واحدة بحدود: مشروع واحد، وملفان لكل مشروع، وقراءة مخطط واحدة، وتقريران Excel في الشهر؛ والمشروع التجريبي لا يُحسب ضمنها.',
+      ['5. الحساب والجهاز', 'أنت مسؤول عن صحة بياناتك وسرية كلمة المرور وكل ما يتم من خلال حسابك. يعمل الحساب على جهاز واحد؛ ومع اشتراك فعّال أو شراء النسخة مدى الحياة يمكن نقله لجهاز جديد، فيُمنع الجهاز القديم من الدخول لهذا الحساب. الفترة المجانية مرة واحدة لكل جهاز. يحتاج التطبيق للإنترنت للتحقق من الحساب، ويعمل بدونه مدة محدودة بعد آخر تحقق.'],
+      ['6. الفترة المجانية والاشتراكات والشراء', '', [
+        'الفترة المجانية 14 يومًا مرة واحدة لكل حساب وجهاز، بحدود: مشروع واحد، وملفان لكل مشروع، وقراءة مخطط واحدة، وتقريران Excel في الشهر؛ والمشروع التجريبي لا يُحسب ضمنها. لا توجد فترة مجانية أخرى بعدها.',
         'بعد ذلك يلزم اشتراك (شهر أو 3 شهور أو 6 شهور) أو شراء النسخة مدى الحياة لمرة واحدة، من داخل التطبيق عبر Google Play أو App Store بالسعر المعروض وقت الشراء.',
         'الاشتراك يتجدد تلقائيًا بنفس المدة والسعر المعروض، ويُخصم من حسابك في المتجر عند التأكيد وعند كل تجديد، إلا إذا ألغيته من إعدادات حسابك في المتجر قبل نهاية المدة (في App Store قبلها بـ24 ساعة على الأقل). الإلغاء يوقف التجديد فقط، وتبقى المزايا حتى نهاية المدة المدفوعة.',
         'بعد انتهاء الفترة المجانية أو الاشتراك دون تجديد تبقى بياناتك متاحة للعرض والنسخ الاحتياطي والتصدير إلى Excel، ولا تُتاح الإضافة أو التعديل حتى تختار باقة.',
@@ -56,9 +56,9 @@ var TERMS = {
         'copy the app\'s design, screens, texts or report templates to make a competing product;',
         'use the app for anything unlawful, overload its server or try to access it without permission.'],
         'Reports you export for your projects (Excel and others) are yours, and you may share them with the parties to your projects.'],
-      ['5. Account and device', 'You are responsible for your details, your password and everything done through your account. An account works on one device; with an active subscription or the lifetime version it can be moved to a new device, and the old device is then blocked from that account. The free trial is once per device. The app needs internet to check the account and works offline for a limited time after the last check.'],
-      ['6. Trial, free version, subscriptions and purchase', '', [
-        'The trial gives every feature for 7 days, once per account and device. Then 14 free days, once, with limits: one project, two files per project, one plan reading and two Excel reports a month; the example project does not count.',
+      ['5. Account and device', 'You are responsible for your details, your password and everything done through your account. An account works on one device; with an active subscription or the lifetime version it can be moved to a new device, and the old device is then blocked from that account. The free period is once per device. The app needs internet to check the account and works offline for a limited time after the last check.'],
+      ['6. Free period, subscriptions and purchase', '', [
+        'The free period is 14 days, once per account and device, with limits: one project, two files per project, one plan reading and two Excel reports a month; the example project does not count. There is no other free period after it.',
         'After that a subscription (1, 3 or 6 months) or the one-time lifetime purchase is required, bought in the app through Google Play or the App Store at the price shown when you buy.',
         'A subscription renews automatically for the same length at the price shown, charged to your store account when you confirm and at each renewal, unless you cancel in your store account settings before the period ends (on the App Store, at least 24 hours before). Cancelling only stops the renewal; you keep the features until the paid period ends.',
         'When the free period or a subscription ends without renewal, your data stays available to view, back up and export to Excel; adding and editing are available again once you choose a plan.',

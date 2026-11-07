@@ -1,19 +1,24 @@
-// Tashtibati licence server: accounts (username + password, Google or Apple), 7-day trial tied to the device,
+// Tashtibati licence server: accounts (username + password, Google or Apple), 14-day limited free period tied to the device, subscriptions,
 // one device per account (moving to a new device only after purchase; the old device is then blocked),
 // Google Play one-time purchase, a help / support assistant, an admin page, and the privacy / deletion pages.
 'use strict';
 const http = require('http');
 const crypto = require('crypto');
+const { AsyncLocalStorage } = require('async_hooks');
+const REQ = new AsyncLocalStorage();   // the request being answered (for the app's terms version)
 const { Pool } = require('pg');
 
 const PORT = +process.env.PORT || 3000;
-const TRIAL_DAYS = +process.env.TRIAL_DAYS || 7;
+const TRIAL_DAYS = process.env.TRIAL_DAYS === undefined ? 0 : Math.max(0, +process.env.TRIAL_DAYS || 0);   // full-feature trial (0 = none; new accounts start in the limited free period)
 const PACKAGE = process.env.PACKAGE_NAME || 'com.efahmy.finishingprojects';
 const PRODUCT_ID = process.env.PRODUCT_ID || 'tashtibati_full';     // one-time purchase: full version for life
 // subscriptions (same product ids on Google Play and the App Store): full version for 1, 3 or 6 months, renewing
 const SUBS = { tashtibati_m1: { plan: 'm1', months: 1 }, tashtibati_m3: { plan: 'm3', months: 3 }, tashtibati_m6: { plan: 'm6', months: 6 } };
 const SUB_IDS = Object.keys(SUBS);
-const FREE_DAYS = process.env.FREE_DAYS === undefined ? 14 : Math.max(0, +process.env.FREE_DAYS || 0);   // limited free period, once, after the trial
+const FREE_DAYS = process.env.FREE_DAYS === undefined ? 14 : Math.max(0, +process.env.FREE_DAYS || 0);   // limited free period, once per account and device
+// terms shipped inside older app versions: still accepted from those apps (they can't show the new text); new apps (x-terms header) must accept the current version
+const TERMS_OLD = (process.env.TERMS_OLD || '1.0,1.1').split(',').map(x => x.trim()).filter(Boolean);
+const termsOk = acc => { const req = REQ.getStore(); return acc.terms_version === TERMS.version || (!(req && req.headers['x-terms']) && TERMS_OLD.includes(acc.terms_version)); };
 const FREE_LIMITS = { projects: 1, filesPerProject: 2, planReads: 1, exportsPerMonth: 2 };
 const ADMIN_USER = process.env.ADMIN_USER || '';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
@@ -169,7 +174,7 @@ async function statusPayload(acc, deviceRow) {
     updates: isFull(acc), latestVersion: LATEST_VERSION, updateUrl: UPDATE_URL, updateUrlIos: IOS_UPDATE_URL,
     devices: devs.map(d => ({ kind: d.kind, model: d.model, lastSeen: d.last_seen, current: d.id === deviceRow })),
     emailVerified: !!acc.email_verified, phone: acc.phone_verified ? acc.phone : '', phoneVerified: !!acc.phone_verified, phoneChannel: acc.phone_channel || 'sms', twofa: !!(acc.twofa && acc.phone_verified),
-    offline: offlinePass(acc, cur && cur.device_id), termsVersion: TERMS.version, termsAccepted: acc.terms_version === TERMS.version };
+    offline: offlinePass(acc, cur && cur.device_id), termsVersion: TERMS.version, termsAccepted: termsOk(acc) };
 }
 function readDevice(b) {
   const id = String(b.deviceId || '').slice(0, 128);
@@ -201,7 +206,7 @@ async function socialAccount(provider, sub, email, name, dev) {
   let username = base;
   for (let i = 0; i < 50; i++) { const [x] = await q('select 1 from accounts where username=$1', [username]); if (!x) break; username = base + (Math.floor(Math.random() * 9000) + 1000); }
   const [usedTrial] = await q('select 1 from trial_devices where device_id=$1', [dev.id]);
-  const trialEnds = usedTrial ? new Date() : new Date(Date.now() + TRIAL_DAYS * 864e5);
+  const trialEnds = usedTrial ? new Date(Date.now() - FREE_DAYS * 864e5) : new Date(Date.now() + TRIAL_DAYS * 864e5);
   [acc] = await q(`insert into accounts(public_id, username, pass_hash, trial_ends, ${col}, email, display_name, email_verified) values($1,$2,$3,$4,$5,$6,$7,$8) returning *`,
     [crypto.randomUUID(), username, provider, trialEnds, sub, email || null, String(name || '').slice(0, 80), !!email]);
   if (!usedTrial) await q('insert into trial_devices(device_id, account_id) values($1,$2) on conflict do nothing', [dev.id, acc.id]);
@@ -337,10 +342,13 @@ async function checkPlaySubs() {
 setInterval(checkPlaySubs, 3 * 3600e3).unref();
 
 // ---------- terms and conditions: each account's accepted version and time ----------
+// the version this app shows: the current one, or an older one from an app that predates it
+const acceptedVersion = v => { const req = REQ.getStore(); return v === TERMS.version ? v : (!(req && req.headers['x-terms']) && TERMS_OLD.includes(v)) ? v : null; };
 async function noteTerms(acc, b) {
-  if (b && b.termsAccepted === TERMS.version && acc.terms_version !== TERMS.version) {
-    await q('update accounts set terms_version=$2, terms_at=now() where id=$1', [acc.id, TERMS.version]);
-    acc.terms_version = TERMS.version;
+  const v = b && acceptedVersion(b.termsAccepted);
+  if (v && acc.terms_version !== TERMS.version && acc.terms_version !== v) {
+    await q('update accounts set terms_version=$2, terms_at=now() where id=$1', [acc.id, v]);
+    acc.terms_version = v;
   }
 }
 function termsHtml() {
@@ -633,8 +641,9 @@ const routes = {
   'GET /api/terms': async () => ({ ok: true, terms: TERMS }),
   'POST /api/terms/accept': async (req, b) => {
     const s = await auth(req);
-    if (b.version !== TERMS.version) throw new HttpErr(409, 'termsOutdated', { version: TERMS.version });
-    await q('update accounts set terms_version=$2, terms_at=now() where id=$1', [s.id, TERMS.version]);
+    const v = b.version === TERMS.version ? TERMS.version : (!req.headers['x-terms'] && TERMS_OLD.includes(b.version)) ? b.version : null;
+    if (!v) throw new HttpErr(409, 'termsOutdated', { version: TERMS.version });
+    await q('update accounts set terms_version=$2, terms_at=now() where id=$1', [s.id, v]);
     const [acc] = await q('select * from accounts where id=$1', [s.id]);
     return statusPayload(acc, s.device_row);
   },
@@ -814,15 +823,15 @@ Include every labelled room or space. Only give numbers you can actually read �
     const username = normUser(b.username), pw = String(b.password || '');
     if (!validUser(username)) throw new HttpErr(400, 'badUsername');
     if (pw.length < 8 || pw.length > 128) throw new HttpErr(400, 'weakPassword');
-    if (b.termsAccepted !== TERMS.version) throw new HttpErr(400, 'termsRequired');
+    if (!acceptedVersion(b.termsAccepted)) throw new HttpErr(400, 'termsRequired');
     const dev = readDevice(b);
     limit('regdev:' + dev.id, 5, 864e5); limit('regall', 300, 3600e3);
     const integ = await checkIntegrity(b, 'register');
     const [exists] = await q('select 1 from accounts where username=$1', [username]);
     if (exists) throw new HttpErr(409, 'usernameTaken');
     const [usedTrial] = await q('select 1 from trial_devices where device_id=$1', [dev.id]);
-    const trialEnds = usedTrial ? new Date() : new Date(Date.now() + TRIAL_DAYS * 864e5);
-    const [acc] = await q('insert into accounts(public_id, username, pass_hash, trial_ends, terms_version, terms_at) values($1,$2,$3,$4,$5,now()) returning *', [crypto.randomUUID(), username, hashPassword(pw), trialEnds, TERMS.version]);
+    const trialEnds = usedTrial ? new Date(Date.now() - FREE_DAYS * 864e5) : new Date(Date.now() + TRIAL_DAYS * 864e5);
+    const [acc] = await q('insert into accounts(public_id, username, pass_hash, trial_ends, terms_version, terms_at) values($1,$2,$3,$4,$5,now()) returning *', [crypto.randomUUID(), username, hashPassword(pw), trialEnds, acceptedVersion(b.termsAccepted)]);
     if (!usedTrial) await q('insert into trial_devices(device_id, account_id) values($1,$2) on conflict do nothing', [dev.id, acc.id]);
     const row = await attachDevice(acc, dev, false); await markIntegrity(row, integ);
     return { ...(await statusPayload(acc, row)), token: await newSession(acc, row), trialUsedOnDevice: !!usedTrial };
@@ -1028,7 +1037,7 @@ const PRIVACY = page('سياسة الخصوصية وشروط الاستخدام 
 <h2>العمل بدون إنترنت</h2><p>بعد كل تحقق ناجح يحصل جهازك على تصريح موقّع يسمح بالعمل بدون إنترنت لمدة ${OFFLINE_DAYS} أيام (وفي الفترة التجريبية حتى نهايتها)، ثم يلزم الاتصال للتحقق مرة أخرى.</p>
 <h2>الحماية</h2><p>الاتصال بخادمنا مشفّر (HTTPS). تسجيل الدخول ينتهي بعد ${SESSION_DAYS} يومًا دون استخدام. قد يستخدم التطبيق خدمة Google Play Integrity للتأكد أنه النسخة الأصلية على جهاز سليم، وتُرسل Google لنا النتيجة فقط. بيانات التطبيق لا تُنسخ في نسخ Android الاحتياطية التلقائية ولا تنتقل لجهاز آخر إلا عبر النسخ الاحتياطي الذي تختاره، ويمكنك حماية ملف النسخة الاحتياطية بكلمة مرور (تشفير AES-256)؛ إذا نسيتها لا يمكن فتح الملف.</p>
 <h2>المساعدة والدعم</h2><p>أسئلتك للمساعد الذكي داخل التطبيق (بعد تسجيل الدخول) تُرسل إلى خادمنا ومزوّد الذكاء الاصطناعي (Anthropic) لتوليد الرد فقط، ولا تُستخدم لأي غرض آخر. الطلبات المحوّلة للدعم تُحفظ لدينا مع اسم المستخدم لمتابعتها، وتُرسل بالبريد إلى ${SUPPORT_EMAIL}.</p>
-<h2>الشراء والاشتراكات والتحديثات</h2><p>بعد الفترة التجريبية (7 أيام) والفترة المجانية المحدودة (14 يومًا) تختار اشتراكًا يتجدد تلقائيًا (شهر أو 3 أو 6 شهور) أو النسخة مدى الحياة بشراء لمرة واحدة، عبر Google Play أو App Store. نحفظ نوع الباقة وتاريخ انتهائها ورقم الطلب ورمز الشراء فقط. الاشتراك والنسخة مدى الحياة يشملان تحديثات التطبيق لنفس الحساب. الحساب يعمل على جهاز واحد، ويمكن نقله لجهاز جديد مع باقة فعّالة، وعندها يُزال الجهاز القديم ولا يمكنه الدخول لهذا الحساب مرة أخرى. الفترة التجريبية مرة واحدة لكل جهاز. إذا استُرد مبلغ الشراء من Google Play يعود الحساب إلى النسخة المنتهية.</p>
+<h2>الشراء والاشتراكات والتحديثات</h2><p>بعد الفترة المجانية (14 يومًا بحدود) تختار اشتراكًا يتجدد تلقائيًا (شهر أو 3 أو 6 شهور) أو النسخة مدى الحياة بشراء لمرة واحدة، عبر Google Play أو App Store. نحفظ نوع الباقة وتاريخ انتهائها ورقم الطلب ورمز الشراء فقط. الاشتراك والنسخة مدى الحياة يشملان تحديثات التطبيق لنفس الحساب. الحساب يعمل على جهاز واحد، ويمكن نقله لجهاز جديد مع باقة فعّالة، وعندها يُزال الجهاز القديم ولا يمكنه الدخول لهذا الحساب مرة أخرى. الفترة التجريبية مرة واحدة لكل جهاز. إذا استُرد مبلغ الشراء من Google Play يعود الحساب إلى النسخة المنتهية.</p>
 <h2>حذف الحساب</h2><p>يمكنك حذف حسابك من داخل التطبيق (الحساب ← حذف الحساب) أو من <a href="/delete-account">صفحة حذف الحساب</a> (لحسابات Google وApple تُرسل طلبًا ونحذفه خلال 7 أيام). يُحذف الحساب وبيانات الأجهزة والجلسات فورًا. بيانات مشاريعك على جهازك ونسخك الاحتياطية تبقى ملكك وتحت تحكمك.</p>
 <h2>الشروط والأحكام</h2><p>استخدام التطبيق يخضع <a href="/terms">للشروط والأحكام</a>.</p>
 <h2>التواصل</h2><p>${CONTACT}</p>
@@ -1038,7 +1047,7 @@ const PRIVACY = page('سياسة الخصوصية وشروط الاستخدام 
 <p>If you add your email or mobile number we keep them only to confirm your account, reset your password and for two-step sign-in. Email codes are sent through our email provider and SMS / WhatsApp codes through Twilio; your details are never used for marketing. After each successful check your device receives a signed pass that lets the app work without internet for ${OFFLINE_DAYS} days (during the trial, until it ends); then it needs a connection again.</p>
 <p>Security: all traffic to our server is encrypted (HTTPS); a sign-in expires after ${SESSION_DAYS} days without use; the app may use Google Play Integrity to confirm it is the genuine app on a genuine device (Google sends us only the verdict); app data is excluded from Android's automatic backup and device-to-device transfer; backup files can be protected with a password (AES-256 encryption — a forgotten password cannot be recovered). If a Google Play purchase is refunded, the account returns to the expired state.</p>
 <p>Questions to the in-app support assistant (when signed in) are sent to our server and our AI provider (Anthropic) only to produce the reply. Issues passed to support are stored with your username and emailed to ${SUPPORT_EMAIL}.</p>
-<p>After the 7-day trial and the limited 14-day free period you choose an auto-renewing subscription (1, 3 or 6 months) or the lifetime version with a one-time purchase, through Google Play or the App Store; we keep only the plan, its end date, the order number and the purchase token. A subscription and the lifetime version include app updates on the same account. An account works on one device; with an active plan it can be moved to a new device, and the old device is then removed and cannot sign in to that account again. You can delete your account in the app or at <a href="/delete-account">/delete-account</a> (Google / Apple accounts: send a request there and we delete it within 7 days). Contact: ${CONTACT}</p></div>`);
+<p>After the 14-day free period (with limits) you choose an auto-renewing subscription (1, 3 or 6 months) or the lifetime version with a one-time purchase, through Google Play or the App Store; we keep only the plan, its end date, the order number and the purchase token. A subscription and the lifetime version include app updates on the same account. An account works on one device; with an active plan it can be moved to a new device, and the old device is then removed and cannot sign in to that account again. You can delete your account in the app or at <a href="/delete-account">/delete-account</a> (Google / Apple accounts: send a request there and we delete it within 7 days). Contact: ${CONTACT}</p></div>`);
 
 const TERMS_PAGE = termsHtml();
 const htmlEsc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -1152,7 +1161,7 @@ const server = http.createServer(async (req, res) => {
       if (/application\/x-www-form-urlencoded/.test(req.headers['content-type'] || '')) body = Object.fromEntries(new URLSearchParams(raw));
       else { try { body = raw ? JSON.parse(raw) : {}; } catch (e) { throw new HttpErr(400, 'badJson'); } }
     }
-    const out = await h(req, body, url);
+    const out = await REQ.run(req, () => h(req, body, url));
     if (out && out.__html) return send(res, 200, out.__html, 'text/html; charset=utf-8');
     send(res, 200, out);
   } catch (e) {
