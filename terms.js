@@ -1,7 +1,7 @@
 // Tashtibati terms and conditions — the same file is used by the app (shown and accepted in the app) and by the server (/terms page, version check).
 // Changing any clause: raise TERMS.version, so every user is asked to accept again.
 var TERMS = {
-  version: '1.0',
+  version: '1.1',
   effective: '2026-10-23',
   ar: {
     title: 'الشروط والأحكام — تطبيق تشطيباتى',
@@ -18,11 +18,14 @@ var TERMS = {
         'نسخ تصميم التطبيق أو شاشاته أو نصوصه أو قوالب تقاريره لعمل منتج منافس.',
         'استخدام التطبيق في أي عمل غير قانوني، أو إرهاق خادمه أو محاولة الدخول غير المصرح به إليه.'],
         'التقارير التي تصدّرها لمشاريعك (Excel وغيرها) ملك لك، ويجوز لك مشاركتها مع أطراف مشاريعك.'],
-      ['5. الحساب والجهاز', 'أنت مسؤول عن صحة بياناتك وسرية كلمة المرور وكل ما يتم من خلال حسابك. يعمل الحساب على جهاز واحد؛ وبعد الشراء يمكن نقله لجهاز جديد، فيُمنع الجهاز القديم من الدخول لهذا الحساب. الفترة التجريبية مرة واحدة لكل جهاز. يحتاج التطبيق للإنترنت للتحقق من الحساب، ويعمل بدونه مدة محدودة بعد آخر تحقق.'],
-      ['6. الفترة التجريبية والشراء', '', [
-        'الفترة التجريبية 7 أيام مجانًا، ثم يلزم شراء لمرة واحدة من داخل التطبيق عبر Google Play أو App Store بالسعر المعروض وقت الشراء.',
-        'يشمل الشراء تحديثات التطبيق المستقبلية لنفس الحساب طالما استمر المالك في تقديم التطبيق.',
-        'الدفع والاسترداد يخضعان لسياسة المتجر الذي اشتريت منه، وإذا استُرد المبلغ يعود الحساب إلى النسخة المنتهية.',
+      ['5. الحساب والجهاز', 'أنت مسؤول عن صحة بياناتك وسرية كلمة المرور وكل ما يتم من خلال حسابك. يعمل الحساب على جهاز واحد؛ ومع اشتراك فعّال أو شراء النسخة مدى الحياة يمكن نقله لجهاز جديد، فيُمنع الجهاز القديم من الدخول لهذا الحساب. الفترة التجريبية مرة واحدة لكل جهاز. يحتاج التطبيق للإنترنت للتحقق من الحساب، ويعمل بدونه مدة محدودة بعد آخر تحقق.'],
+      ['6. الفترة التجريبية والنسخة المجانية والاشتراكات والشراء', '', [
+        'الفترة التجريبية 7 أيام بكل المزايا، مرة واحدة لكل حساب وجهاز. بعدها 14 يومًا مجانية مرة واحدة بحدود: مشروع واحد، وملفان لكل مشروع، وقراءة مخطط واحدة، وتقريران Excel في الشهر؛ والمشروع التجريبي لا يُحسب ضمنها.',
+        'بعد ذلك يلزم اشتراك (شهر أو 3 شهور أو 6 شهور) أو شراء النسخة مدى الحياة لمرة واحدة، من داخل التطبيق عبر Google Play أو App Store بالسعر المعروض وقت الشراء.',
+        'الاشتراك يتجدد تلقائيًا بنفس المدة والسعر المعروض، ويُخصم من حسابك في المتجر عند التأكيد وعند كل تجديد، إلا إذا ألغيته من إعدادات حسابك في المتجر قبل نهاية المدة (في App Store قبلها بـ24 ساعة على الأقل). الإلغاء يوقف التجديد فقط، وتبقى المزايا حتى نهاية المدة المدفوعة.',
+        'بعد انتهاء الفترة المجانية أو الاشتراك دون تجديد تبقى بياناتك متاحة للعرض والنسخ الاحتياطي والتصدير إلى Excel، ولا تُتاح الإضافة أو التعديل حتى تختار باقة.',
+        'يشمل الاشتراك الفعّال والنسخة مدى الحياة تحديثات التطبيق المستقبلية لنفس الحساب طالما استمر المالك في تقديم التطبيق.',
+        'الدفع والاسترداد يخضعان لسياسة المتجر الذي اشتريت منه، وإذا استُرد المبلغ يُلغى ما يقابله من اشتراك أو شراء.',
         'قد تُطرح مستقبلًا خدمات إضافية جديدة بمقابل منفصل (مثل القراءة الذكية الموسعة)، ولن يُسحب منك أي شيء اشتريته.']],
       ['7. بياناتك ومسؤوليتك عنها', 'بيانات المشاريع محفوظة على جهازك وفي النسخ الاحتياطية التي تختارها. أنت المسؤول عن عمل النسخ الاحتياطية، ولا يضمن المالك استعادة بيانات فُقدت بسبب حذف التطبيق أو تلف الجهاز أو نسيان كلمة مرور النسخة الاحتياطية. بيانات عملائك ومقاوليك وفريقك التي تدخلها (أسماء، أرقام، رسائل واتساب) مسؤوليتك، وعليك استخدامها لأغراض عملك ووفق القانون، ومنه قانون حماية البيانات الشخصية رقم 151 لسنة 2020. يتعامل المالك مع بيانات حسابك وفق سياسة الخصوصية.'],
       ['8. دقة الحسابات والقراءة الآلية', 'يحسب التطبيق الأرصدة والأتعاب والمساحات تلقائيًا، ويقرأ المبالغ من الرسائل والمقاسات من الصور آليًا، وقد يخطئ. التطبيق أداة مساعدة لتنظيم السجلات وليس بديلًا عن المراجعة المحاسبية أو الهندسية أو القانونية أو الضريبية. عليك مراجعة كل رقم قبل الاعتماد عليه، وأنت وحدك المسؤول عن اتفاقاتك ومحاسباتك مع عملائك ومقاوليك.'],
@@ -53,11 +56,14 @@ var TERMS = {
         'copy the app\'s design, screens, texts or report templates to make a competing product;',
         'use the app for anything unlawful, overload its server or try to access it without permission.'],
         'Reports you export for your projects (Excel and others) are yours, and you may share them with the parties to your projects.'],
-      ['5. Account and device', 'You are responsible for your details, your password and everything done through your account. An account works on one device; after purchase it can be moved to a new device, and the old device is then blocked from that account. The free trial is once per device. The app needs internet to check the account and works offline for a limited time after the last check.'],
-      ['6. Trial and purchase', '', [
-        'The trial is free for 7 days; then a one-time in-app purchase through Google Play or the App Store is required, at the price shown when you buy.',
-        'The purchase includes future updates of the app on the same account for as long as the owner keeps offering the app.',
-        'Payment and refunds follow the policy of the store you bought from; if the payment is refunded, the account returns to the expired state.',
+      ['5. Account and device', 'You are responsible for your details, your password and everything done through your account. An account works on one device; with an active subscription or the lifetime version it can be moved to a new device, and the old device is then blocked from that account. The free trial is once per device. The app needs internet to check the account and works offline for a limited time after the last check.'],
+      ['6. Trial, free version, subscriptions and purchase', '', [
+        'The trial gives every feature for 7 days, once per account and device. Then 14 free days, once, with limits: one project, two files per project, one plan reading and two Excel reports a month; the example project does not count.',
+        'After that a subscription (1, 3 or 6 months) or the one-time lifetime purchase is required, bought in the app through Google Play or the App Store at the price shown when you buy.',
+        'A subscription renews automatically for the same length at the price shown, charged to your store account when you confirm and at each renewal, unless you cancel in your store account settings before the period ends (on the App Store, at least 24 hours before). Cancelling only stops the renewal; you keep the features until the paid period ends.',
+        'When the free period or a subscription ends without renewal, your data stays available to view, back up and export to Excel; adding and editing are available again once you choose a plan.',
+        'An active subscription and the lifetime version include future updates of the app on the same account for as long as the owner keeps offering the app.',
+        'Payment and refunds follow the policy of the store you bought from; if a payment is refunded, the matching subscription or purchase is cancelled.',
         'New optional services may in future be offered for a separate fee (such as extended smart reading); nothing you have bought will be taken away.']],
       ['7. Your data and your responsibility for it', 'Project data is kept on your device and in the backups you choose. You are responsible for making backups; the owner does not guarantee recovery of data lost through deleting the app, a damaged device or a forgotten backup password. The details of your clients, contractors and team that you enter (names, numbers, WhatsApp messages) are your responsibility, and you must use them for your work and lawfully, including under Egypt\'s Personal Data Protection Law No. 151 of 2020. The owner handles your account data as the privacy policy describes.'],
       ['8. Accuracy of calculations and automatic reading', 'The app calculates balances, fees and areas automatically, and reads amounts from messages and sizes from pictures automatically; it can make mistakes. It is a tool for organising records, not a substitute for accounting, engineering, legal or tax review. Check every number before relying on it; you alone are responsible for your agreements and settlements with clients and contractors.'],

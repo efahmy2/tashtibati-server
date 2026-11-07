@@ -9,7 +9,12 @@ const { Pool } = require('pg');
 const PORT = +process.env.PORT || 3000;
 const TRIAL_DAYS = +process.env.TRIAL_DAYS || 7;
 const PACKAGE = process.env.PACKAGE_NAME || 'com.efahmy.finishingprojects';
-const PRODUCT_ID = process.env.PRODUCT_ID || 'tashtibati_full';
+const PRODUCT_ID = process.env.PRODUCT_ID || 'tashtibati_full';     // one-time purchase: full version for life
+// subscriptions (same product ids on Google Play and the App Store): full version for 1, 3 or 6 months, renewing
+const SUBS = { tashtibati_m1: { plan: 'm1', months: 1 }, tashtibati_m3: { plan: 'm3', months: 3 }, tashtibati_m6: { plan: 'm6', months: 6 } };
+const SUB_IDS = Object.keys(SUBS);
+const FREE_DAYS = process.env.FREE_DAYS === undefined ? 14 : Math.max(0, +process.env.FREE_DAYS || 0);   // limited free period, once, after the trial
+const FREE_LIMITS = { projects: 1, filesPerProject: 2, planReads: 1, exportsPerMonth: 2 };
 const ADMIN_USER = process.env.ADMIN_USER || '';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';   // OAuth "Web application" client id (same Google Cloud project as the Android client)
@@ -93,6 +98,13 @@ async function migrate() {
     alter table accounts add column if not exists terms_version text;
     alter table accounts add column if not exists terms_at timestamptz;
     update accounts set email_verified=true where not email_verified and email is not null and (google_sub is not null or apple_sub is not null);
+    alter table accounts add column if not exists plan text;
+    alter table accounts add column if not exists plan_until timestamptz;
+    alter table accounts add column if not exists plan_store text;
+    alter table accounts add column if not exists plan_renews boolean;
+    alter table accounts add column if not exists free_plan_reads int not null default 0;
+    alter table purchases add column if not exists expires_at timestamptz;
+    alter table purchases add column if not exists checked_at timestamptz;
     create table if not exists verify_codes (
       id serial primary key, account_id int not null references accounts(id) on delete cascade, purpose text not null, target text not null,
       code_hash text not null, expires timestamptz not null, attempts int not null default 0, used boolean not null default false, created_at timestamptz not null default now());
@@ -140,13 +152,21 @@ function clientIp(req) {
   return xff[0] || req.socket.remoteAddress || '';
 }
 
-function stateOf(acc) { if (acc.paid) return 'paid'; return new Date(acc.trial_ends) > new Date() ? 'trial' : 'expired'; }
+// paid (lifetime) → sub (active subscription) → trial (full, 7 days) → free (limited, 14 days, once) → expired (view, back up and export only)
+const freeEnds = acc => new Date(new Date(acc.trial_ends).getTime() + FREE_DAYS * 864e5);
+function stateOf(acc) { const now = new Date();
+  if (acc.paid) return 'paid'; if (acc.plan_until && new Date(acc.plan_until) > now) return 'sub';
+  if (new Date(acc.trial_ends) > now) return 'trial'; return freeEnds(acc) > now ? 'free' : 'expired'; }
+const isFull = acc => ['paid', 'sub'].includes(stateOf(acc));
 async function statusPayload(acc, deviceRow) {
   const devs = await q('select id, device_id, kind, model, last_seen from devices where account_id=$1 and active order by kind', [acc.id]);
   const cur = devs.find(d => d.id === deviceRow);
   return { ok: true, username: acc.username, displayName: acc.display_name || '', email: acc.email || '', google: !!acc.google_sub, apple: !!acc.apple_sub, social: ['google', 'apple'].includes(acc.pass_hash) ? acc.pass_hash : '', accountId: acc.public_id, state: stateOf(acc), trialEnds: acc.trial_ends, paidAt: acc.paid_at,
     serverTime: new Date().toISOString(), productId: PRODUCT_ID, trialDays: TRIAL_DAYS,
-    updates: stateOf(acc) === 'paid', latestVersion: LATEST_VERSION, updateUrl: UPDATE_URL, updateUrlIos: IOS_UPDATE_URL,
+    plan: acc.paid ? 'lifetime' : stateOf(acc) === 'sub' ? acc.plan : null, planUntil: acc.plan_until || null, planStore: acc.plan_store || null, planRenews: acc.plan_renews !== false,
+    freeEnds: freeEnds(acc).toISOString(), freeDays: FREE_DAYS, limits: FREE_LIMITS, planReadsUsed: acc.free_plan_reads || 0,
+    products: { lifetime: PRODUCT_ID, m1: 'tashtibati_m1', m3: 'tashtibati_m3', m6: 'tashtibati_m6' },
+    updates: isFull(acc), latestVersion: LATEST_VERSION, updateUrl: UPDATE_URL, updateUrlIos: IOS_UPDATE_URL,
     devices: devs.map(d => ({ kind: d.kind, model: d.model, lastSeen: d.last_seen, current: d.id === deviceRow })),
     emailVerified: !!acc.email_verified, phone: acc.phone_verified ? acc.phone : '', phoneVerified: !!acc.phone_verified, phoneChannel: acc.phone_channel || 'sms', twofa: !!(acc.twofa && acc.phone_verified),
     offline: offlinePass(acc, cur && cur.device_id), termsVersion: TERMS.version, termsAccepted: acc.terms_version === TERMS.version };
@@ -165,8 +185,8 @@ async function attachDevice(acc, dev, transfer) {
   if (same) { await q('update devices set last_seen=now(), model=$2, kind=$3 where id=$1', [same.id, dev.model || same.model, dev.kind]); return same.id; }
   const other = cur[0];
   if (other) {
-    const info = { model: other.model, kind: other.kind, lastSeen: other.last_seen, canTransfer: !!acc.paid };
-    if (!acc.paid || !transfer) throw new HttpErr(409, 'otherDevice', info);
+    const info = { model: other.model, kind: other.kind, lastSeen: other.last_seen, canTransfer: isFull(acc) };
+    if (!isFull(acc) || !transfer) throw new HttpErr(409, 'otherDevice', info);
     await q('update devices set active=false, revoked=true, revoked_at=now() where account_id=$1 and active', [acc.id]);
   }
   const [row] = await q('insert into devices(account_id, device_id, kind, model) values($1,$2,$3,$4) returning id', [acc.id, dev.id, dev.kind, dev.model]);
@@ -254,6 +274,68 @@ async function verifyPlay(token, productId) {
   return { configured: true, data: j };
 }
 
+// ---------- subscriptions (1, 3 or 6 months): each purchase keeps its end date; the account gets the latest one ----------
+const enc = encodeURIComponent;
+async function verifyPlaySub(token) {
+  const sa = serviceAccount();
+  if (!sa) return { configured: false };
+  const at = await googleToken(sa);
+  const r = await fetch(`https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${enc(PACKAGE)}/purchases/subscriptionsv2/tokens/${enc(token)}`, { headers: { authorization: 'Bearer ' + at } });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) return { configured: true, error: (j.error && j.error.message) || String(r.status) };
+  const li = (j.lineItems || []).find(x => SUBS[x.productId]) || (j.lineItems || [])[0] || {};
+  // a new subscription must be acknowledged within 3 days or Google refunds it
+  if (j.acknowledgementState === 'ACKNOWLEDGEMENT_STATE_PENDING' && li.productId) {
+    await fetch(`https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${enc(PACKAGE)}/purchases/subscriptions/${enc(li.productId)}/tokens/${enc(token)}:acknowledge`,
+      { method: 'POST', headers: { authorization: 'Bearer ' + at, 'content-type': 'application/json' }, body: '{}' }).catch(() => {});
+  }
+  const expires = li.expiryTime ? new Date(li.expiryTime) : null;
+  const valid = ['SUBSCRIPTION_STATE_ACTIVE', 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD', 'SUBSCRIPTION_STATE_CANCELED'].includes(j.subscriptionState) && expires && expires > new Date();
+  return { configured: true, data: j, productId: li.productId, expires, renews: !!(li.autoRenewingPlan && li.autoRenewingPlan.autoRenewEnabled), valid,
+    pending: j.subscriptionState === 'SUBSCRIPTION_STATE_PENDING', account: j.externalAccountIdentifiers && j.externalAccountIdentifiers.obfuscatedExternalAccountId };
+}
+async function refreshPlan(accountId) {
+  if (!accountId) return;
+  const [r] = await q(`select product_id, expires_at, detail from purchases where account_id=$1 and state='active' and expires_at > now() order by expires_at desc limit 1`, [accountId]);
+  if (r) await q('update accounts set plan=$2, plan_until=$3, plan_store=$4, plan_renews=$5 where id=$1',
+    [accountId, (SUBS[r.product_id] || {}).plan || null, r.expires_at, (r.detail && r.detail.store) || null, !(r.detail && r.detail.renews === false)]);
+  else await q(`update accounts set plan_until=case when plan_store='admin' then plan_until else least(plan_until, now()) end, plan_renews=false where id=$1 and plan_until is not null and coalesce(plan_store,'')<>'admin'`, [accountId]);
+}
+async function savePlaySub(accountId, token, orderId, v) {
+  const state = v.valid ? 'active' : v.pending ? 'pending' : 'expired';
+  await q(`insert into purchases(account_id, token, order_id, product_id, state, detail, expires_at, checked_at) values($1,$2,$3,$4,$5,$6,$7,now())
+           on conflict (token) do update set state=case when purchases.state='voided' then 'voided' else excluded.state end, detail=excluded.detail, expires_at=excluded.expires_at, checked_at=now(),
+           account_id=coalesce(purchases.account_id, excluded.account_id)`,
+    [accountId, token, String(orderId || (v.data && v.data.latestOrderId) || '').slice(0, 64), v.productId, state,
+     JSON.stringify({ store: 'google_play', renews: v.renews, subscriptionState: v.data && v.data.subscriptionState }), v.expires]);
+  return state;
+}
+async function saveAppleSub(accountId, t, extra = {}) {
+  const now = Date.now(), exp = t.expiresDate ? new Date(+t.expiresDate) : null;
+  const state = t.revocationDate ? 'voided' : exp && exp.getTime() > now ? 'active' : 'expired';
+  const rows = await q(`insert into purchases(account_id, token, order_id, product_id, state, detail, expires_at, checked_at) values($1,$2,$3,$4,$5,$6,$7,now())
+           on conflict (token) do update set state=case when excluded.state='voided' then 'voided' when greatest(purchases.expires_at, excluded.expires_at) > now() then 'active' else excluded.state end,
+           detail=purchases.detail || excluded.detail, product_id=excluded.product_id,
+           expires_at=greatest(purchases.expires_at, excluded.expires_at), checked_at=now(), account_id=coalesce(purchases.account_id, excluded.account_id)
+           returning account_id`,
+    [accountId, 'apple:' + t.originalTransactionId, String(t.transactionId || '').slice(0, 64), t.productId, state,
+     JSON.stringify({ store: 'app_store', environment: t.environment, transactionId: t.transactionId, ...extra }), exp]);
+  if (state === 'voided') await q(`update purchases set expires_at=now() where token=$1`, ['apple:' + t.originalTransactionId]);
+  return { state, accountId: rows[0] && rows[0].account_id };
+}
+// renewals on Google Play: check subscriptions that end within a day (or ended in the last week) every few hours
+async function checkPlaySubs() {
+  if (!serviceAccount() || !dbReady) return;
+  try {
+    const rows = await q(`select token, account_id, order_id from purchases where product_id = any($1) and detail->>'store'='google_play' and state in ('active','expired','pending')
+                          and expires_at between now() - interval '7 days' and now() + interval '1 day' and (checked_at is null or checked_at < now() - interval '3 hours') limit 200`, [SUB_IDS]);
+    for (const r of rows) { const v = await verifyPlaySub(r.token).catch(e => ({ error: e.message }));
+      if (v.data) { await savePlaySub(r.account_id, r.token, r.order_id, v); await refreshPlan(r.account_id); } }
+    if (rows.length) console.log('subscriptions checked:', rows.length);
+  } catch (e) { console.error('subscription check', e.message); }
+}
+setInterval(checkPlaySubs, 3 * 3600e3).unref();
+
 // ---------- terms and conditions: each account's accepted version and time ----------
 async function noteTerms(acc, b) {
   if (b && b.termsAccepted === TERMS.version && acc.terms_version !== TERMS.version) {
@@ -273,6 +355,7 @@ function offlinePass(acc, deviceId) {
   if (!OFFLINE_KEY || !OFFLINE_DAYS || !deviceId) return null;
   const st = stateOf(acc); if (st === 'expired') return null;
   let until = Date.now() + OFFLINE_DAYS * 864e5; if (st === 'trial') until = Math.min(until, new Date(acc.trial_ends).getTime());
+  if (st === 'free') until = Math.min(until, freeEnds(acc).getTime()); if (st === 'sub') until = Math.min(until, new Date(acc.plan_until).getTime() + 864e5);
   const p = Buffer.from(JSON.stringify({ a: acc.public_id, d: deviceId, s: st, u: until, t: Date.now() })).toString('base64url');
   return { p, s: crypto.sign('sha256', Buffer.from(p), { key: OFFLINE_KEY, dsaEncoding: 'ieee-p1363' }).toString('base64url'), days: OFFLINE_DAYS };
 }
@@ -401,12 +484,13 @@ async function checkVoided() {
     const at = await googleToken(sa); let pageTok = '', removed = 0;
     do {
       const u = new URL(`https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${encodeURIComponent(PACKAGE)}/purchases/voidedpurchases`);
-      u.searchParams.set('startTime', String(Date.now() - 30 * 864e5)); u.searchParams.set('maxResults', '1000'); if (pageTok) u.searchParams.set('token', pageTok);
+      u.searchParams.set('startTime', String(Date.now() - 30 * 864e5)); u.searchParams.set('maxResults', '1000'); u.searchParams.set('type', '1'); if (pageTok) u.searchParams.set('token', pageTok);
       const r = await fetch(u, { headers: { authorization: 'Bearer ' + at } }); const j = await r.json().catch(() => ({}));
       if (!r.ok) { console.error('voided purchases', r.status, j.error && j.error.message); return; }
       for (const v of j.voidedPurchases || []) {
-        const rows = await q(`update purchases set state='voided', detail=coalesce(detail,'{}'::jsonb) || $2::jsonb where token=$1 and state<>'voided' returning account_id`, [v.purchaseToken, JSON.stringify({ voided: v })]);
-        for (const p of rows) if (p.account_id) {
+        const rows = await q(`update purchases set state='voided', expires_at=least(expires_at, now()), detail=coalesce(detail,'{}'::jsonb) || $2::jsonb where token=$1 and state<>'voided' returning account_id, product_id`, [v.purchaseToken, JSON.stringify({ voided: v })]);
+        for (const p of rows) if (p.account_id && SUBS[p.product_id]) { await refreshPlan(p.account_id); removed++; }
+        for (const p of rows) if (p.account_id && !SUBS[p.product_id]) {
           const [still] = await q(`select 1 from purchases where account_id=$1 and state='purchased'`, [p.account_id]);
           if (!still) { const u2 = await q(`update accounts set paid=false, note=left(coalesce(note,'') || ' [refund ' || to_char(now(),'YYYY-MM-DD') || ']', 500) where id=$1 and paid and paid_via='google_play' returning id`, [p.account_id]); removed += u2.length; }
         }
@@ -513,6 +597,17 @@ const routes = {
     const n = verifyAppleJws(b.signedPayload);
     const d = n.data || {};
     if (d.bundleId && d.bundleId !== IOS_BUNDLE_ID) return { ok: true };
+    if (d.signedTransactionInfo) {
+      const t0 = verifyAppleJws(d.signedTransactionInfo);
+      if (SUBS[t0.productId]) {      // subscriptions: renewed, expired, refunded, renewal switched off…
+        let renews; if (d.signedRenewalInfo) { try { renews = verifyAppleJws(d.signedRenewalInfo).autoRenewStatus === 1; } catch (e) {} }
+        let accId = null; if (t0.appAccountToken) { const [a] = await q('select id from accounts where public_id=$1', [String(t0.appAccountToken).toLowerCase()]); accId = a ? a.id : null; }
+        const r = await saveAppleSub(accId, t0, { renews: renews !== false, last: n.notificationType });
+        await refreshPlan(r.accountId || accId);
+        console.log('app store', n.notificationType, t0.productId);
+        return { ok: true };
+      }
+    }
     if (['REFUND', 'REVOKE'].includes(n.notificationType) && d.signedTransactionInfo) {
       const t = verifyAppleJws(d.signedTransactionInfo);
       const k = await appleRefund(t.originalTransactionId, { type: n.notificationType, at: Date.now(), transactionId: t.transactionId });
@@ -599,7 +694,9 @@ ${kb}`;
   // read room names and sizes from a photo of a unit plan (AI vision); the app shows the result for review
   'POST /api/plan-read': async (req, b) => {
     const s = await auth(req);
-    if (stateOf(s) === 'expired') throw new HttpErr(403, 'expired');
+    const st = stateOf(s);
+    if (st === 'expired') throw new HttpErr(403, 'expired');
+    if (st === 'free' && (s.free_plan_reads || 0) >= FREE_LIMITS.planReads) throw new HttpErr(403, 'freeLimit', { what: 'planReads' });
     limit('plan:' + s.id, 40, 864e5);
     if (!AI_KEY) throw new HttpErr(503, 'aiNotConfigured');
     if (!aiBudget(3)) throw new HttpErr(503, 'aiBusy');
@@ -625,7 +722,8 @@ Include every labelled room or space. Only give numbers you can actually read �
     if (!plan || !Array.isArray(plan.spaces)) throw new HttpErr(422, 'planUnreadable');
     const n = v => (typeof v === 'number' && isFinite(v) && v > 0 && v < 100000 ? Math.round(v * 100) / 100 : null);
     plan.spaces = plan.spaces.slice(0, 120).map(x => ({ name: String(x.name || '').slice(0, 60), nameAr: String(x.nameAr || '').slice(0, 60), type: String(x.type || 'other').slice(0, 20), floor: x.floor ? String(x.floor).slice(0, 20) : null, length: n(x.length), width: n(x.width), area: n(x.area) }));
-    return { ok: true, plan: { floor: plan.floor || null, floorLabel: plan.floorLabel || null, floorArea: n(plan.floorArea), totalArea: n(plan.totalArea),
+    if (st === 'free') await q('update accounts set free_plan_reads=free_plan_reads+1 where id=$1', [s.id]);
+    return { ok: true, planReadsUsed: st === 'free' ? (s.free_plan_reads || 0) + 1 : 0, plan: { floor: plan.floor || null, floorLabel: plan.floorLabel || null, floorArea: n(plan.floorArea), totalArea: n(plan.totalArea),
       floors: (Array.isArray(plan.floors) ? plan.floors : []).slice(0, 12).map(f => ({ floor: String((f && f.floor) || '').slice(0, 20), area: n(f && f.area) })), spaces: plan.spaces } };
   },
 
@@ -705,7 +803,7 @@ Include every labelled room or space. Only give numbers you can actually read �
   // moving to a new device from the old one: this device is removed and blocked for this account (full version only)
   'POST /api/release-device': async (req) => {
     const s = await auth(req);
-    if (!s.paid) throw new HttpErr(403, 'transferNeedsPurchase');
+    if (!isFull(s)) throw new HttpErr(403, 'transferNeedsPurchase');
     if (s.device_row) await q('update devices set active=false, revoked=true, revoked_at=now() where id=$1', [s.device_row]);
     return { ok: true };
   },
@@ -754,6 +852,14 @@ Include every labelled room or space. Only give numbers you can actually read �
       const key = 'apple:' + t.originalTransactionId;
       const [prev] = await q('select * from purchases where token=$1', [key]);
       if (prev && prev.account_id && prev.account_id !== s.id) throw new HttpErr(409, 'purchaseOtherAccount');
+      if (SUBS[t.productId]) {
+        if (t.bundleId !== IOS_BUNDLE_ID) throw new HttpErr(400, 'badPurchase');
+        if (t.appAccountToken && String(t.appAccountToken).toLowerCase() !== String(s.public_id).toLowerCase() && await accountExists(t.appAccountToken)) {
+          const [acc0] = await q('select * from accounts where id=$1', [s.id]); return { ...(await statusPayload(acc0, s.device_row)), purchase: 'wrongAccount' }; }
+        const r = await saveAppleSub(s.id, t); await refreshPlan(s.id);
+        const [acc2] = await q('select * from accounts where id=$1', [s.id]);
+        return { ...(await statusPayload(acc2, s.device_row)), purchase: r.state === 'active' ? 'purchased' : r.state };
+      }
       let state = 'purchased';
       if (t.bundleId !== IOS_BUNDLE_ID || t.productId !== PRODUCT_ID) state = 'error';
       else if (t.appAccountToken && String(t.appAccountToken).toLowerCase() !== String(s.public_id).toLowerCase() && await accountExists(t.appAccountToken)) state = 'wrongAccount';
@@ -767,6 +873,18 @@ Include every labelled room or space. Only give numbers you can actually read �
     }
     const [old] = await q('select * from purchases where token=$1', [token]);
     if (old && old.account_id && old.account_id !== s.id) throw new HttpErr(409, 'purchaseOtherAccount');
+    if (SUBS[productId]) {               // Google Play subscription
+      const v = await verifyPlaySub(token).catch(e => ({ configured: true, error: e.message }));
+      let state;
+      if (!v.configured || v.error) {
+        state = v.configured ? 'error' : 'review';
+        await q(`insert into purchases(account_id, token, order_id, product_id, state, detail) values($1,$2,$3,$4,$5,$6) on conflict (token) do update set state=excluded.state, detail=excluded.detail`,
+          [s.id, token, String(b.orderId || '').slice(0, 64), productId, state, JSON.stringify({ store: 'google_play', error: v.error || null, verified: false })]);
+      } else if (v.account && v.account !== s.public_id && await accountExists(v.account)) state = 'wrongAccount';
+      else { const st = await savePlaySub(s.id, token, b.orderId, v); await refreshPlan(s.id); state = st === 'active' ? 'purchased' : st; }
+      const [acc] = await q('select * from accounts where id=$1', [s.id]);
+      return { ...(await statusPayload(acc, s.device_row)), purchase: state };
+    }
     const v = await verifyPlay(token, productId).catch(e => ({ configured: true, error: e.message }));
     let state = 'review';
     if (v.configured && v.data) {
@@ -808,20 +926,43 @@ Include every labelled room or space. Only give numbers you can actually read �
   // ---------- admin ----------
   'GET /admin/api/accounts': async (req, b, url) => {
     adminAuth(req);
-    const term = '%' + (url.searchParams.get('q') || '').toLowerCase() + '%';
+    const P = url.searchParams, term = '%' + (P.get('q') || '').toLowerCase().trim() + '%';
+    const ST = `case when a.paid then 'paid' when a.plan_until > now() then 'sub' when a.trial_ends > now() then 'trial'
+                     when a.trial_ends + make_interval(days => ${FREE_DAYS}) > now() then 'free' else 'expired' end`;
+    const PL = `case when a.paid then 'lifetime' when a.plan_until > now() then a.plan else null end`;
+    const where = ['(a.username like $1 or lower(coalesce(a.email,\'\')) like $1)'], args = [term];
+    const add = (sql, v) => { args.push(v); where.push(sql.replace('?', '$' + args.length)); };
+    const state = P.get('state'), plan = P.get('plan'), store = P.get('store'), renew = P.get('renew');
+    if (['paid', 'sub', 'trial', 'free', 'expired'].includes(state)) add(`${ST} = ?`, state);
+    if (['m1', 'm3', 'm6', 'lifetime'].includes(plan)) add(`${PL} = ?`, plan);
+    if (['google_play', 'app_store', 'admin'].includes(store)) add(`(case when a.paid then a.paid_via when a.plan_until > now() then a.plan_store else null end) = ?`, store);
+    if (renew === 'soon') where.push(`a.plan_until between now() and now() + interval '7 days'`);
+    if (renew === 'off') where.push(`a.plan_until > now() and a.plan_renews = false`);
+    if (renew === 'lapsed') where.push(`not a.paid and a.plan_until between now() - interval '30 days' and now()`);
     const rows = await q(`select a.id, a.username, a.email, a.google_sub is not null as google, a.created_at, a.trial_ends, a.paid, a.paid_at, a.paid_via, a.note,
+        a.plan, a.plan_until, a.plan_store, a.plan_renews, a.free_plan_reads, ${ST} as st, ${PL} as cur_plan,
         (select json_agg(json_build_object('id', d.id, 'kind', d.kind, 'model', d.model, 'lastSeen', d.last_seen)) from devices d where d.account_id=a.id and d.active) as devices,
         (select count(*)::int from devices d where d.account_id=a.id and d.revoked) as blocked, a.apple_sub is not null as apple, a.email_verified, a.phone, a.phone_verified, a.twofa, a.terms_version, a.terms_at,
-        (select json_agg(json_build_object('order', p.order_id, 'state', p.state, 'at', p.created_at)) from purchases p where p.account_id=a.id) as purchases
-      from accounts a where a.username like $1 order by a.created_at desc limit 300`, [term]);
-    const [tot] = await q(`select count(*)::int as all, count(*) filter (where paid)::int as paid, count(*) filter (where not paid and trial_ends>now())::int as trial from accounts`);
-    return { ok: true, totals: tot, accounts: rows.map(r => ({ ...r, state: stateOf(r) })) };
+        (select json_agg(json_build_object('order', p.order_id, 'product', p.product_id, 'state', p.state, 'at', p.created_at, 'expires', p.expires_at, 'store', p.detail->>'store') order by p.created_at desc) from purchases p where p.account_id=a.id) as purchases
+      from accounts a where ${where.join(' and ')} order by a.created_at desc limit 500`, args);
+    const [tot] = await q(`select count(*)::int as all,
+        count(*) filter (where ${ST}='paid')::int as paid, count(*) filter (where ${ST}='sub')::int as sub, count(*) filter (where ${ST}='trial')::int as trial,
+        count(*) filter (where ${ST}='free')::int as free, count(*) filter (where ${ST}='expired')::int as expired,
+        count(*) filter (where ${PL}='m1')::int as m1, count(*) filter (where ${PL}='m3')::int as m3, count(*) filter (where ${PL}='m6')::int as m6, count(*) filter (where ${PL}='lifetime')::int as lifetime,
+        count(*) filter (where a.plan_until between now() and now() + interval '7 days')::int as soon, count(*) filter (where a.plan_until > now() and a.plan_renews = false)::int as renew_off,
+        count(*) filter (where not a.paid and a.plan_until between now() - interval '30 days' and now())::int as lapsed,
+        count(*) filter (where a.created_at > now() - interval '7 days')::int as new7
+      from accounts a`);
+    return { ok: true, totals: tot, freeDays: FREE_DAYS, accounts: rows.map(r => ({ ...r, state: r.st, freeEnds: freeEnds(r) })) };
   },
   'POST /admin/api/account': async (req, b) => {
     adminAuth(req);
     const id = +b.id; if (!id) throw new HttpErr(400, 'badId');
     if (b.action === 'markPaid') await q(`update accounts set paid=true, paid_at=now(), paid_via='admin' where id=$1`, [id]);
     else if (b.action === 'markUnpaid') await q(`update accounts set paid=false, paid_at=null, paid_via=null where id=$1`, [id]);
+    else if (b.action === 'grantSub') { const m = [1, 3, 6].includes(+b.months) ? +b.months : 1;
+      await q(`update accounts set plan=$2, plan_until=greatest(coalesce(plan_until, now()), now()) + make_interval(months => $3), plan_store='admin', plan_renews=false where id=$1`, [id, 'm' + m, m]); }
+    else if (b.action === 'endSub') await q(`update accounts set plan_until=now(), plan_renews=false where id=$1 and plan_until > now()`, [id]);
     else if (b.action === 'extendTrial') await q(`update accounts set trial_ends=greatest(trial_ends, now()) + ($2 || ' days')::interval where id=$1`, [id, String(Math.min(365, Math.max(1, +b.days || 7)))]);
     else if (b.action === 'resetDevices') { await q('update devices set active=false where account_id=$1', [id]); await q('delete from sessions where account_id=$1', [id]); }
     else if (b.action === 'removeDevice') { await q('update devices set active=false where id=$1 and account_id=$2', [+b.deviceId, id]); await q('delete from sessions where device_row=$1', [+b.deviceId]); }
@@ -887,7 +1028,7 @@ const PRIVACY = page('سياسة الخصوصية وشروط الاستخدام 
 <h2>العمل بدون إنترنت</h2><p>بعد كل تحقق ناجح يحصل جهازك على تصريح موقّع يسمح بالعمل بدون إنترنت لمدة ${OFFLINE_DAYS} أيام (وفي الفترة التجريبية حتى نهايتها)، ثم يلزم الاتصال للتحقق مرة أخرى.</p>
 <h2>الحماية</h2><p>الاتصال بخادمنا مشفّر (HTTPS). تسجيل الدخول ينتهي بعد ${SESSION_DAYS} يومًا دون استخدام. قد يستخدم التطبيق خدمة Google Play Integrity للتأكد أنه النسخة الأصلية على جهاز سليم، وتُرسل Google لنا النتيجة فقط. بيانات التطبيق لا تُنسخ في نسخ Android الاحتياطية التلقائية ولا تنتقل لجهاز آخر إلا عبر النسخ الاحتياطي الذي تختاره، ويمكنك حماية ملف النسخة الاحتياطية بكلمة مرور (تشفير AES-256)؛ إذا نسيتها لا يمكن فتح الملف.</p>
 <h2>المساعدة والدعم</h2><p>أسئلتك للمساعد الذكي داخل التطبيق (بعد تسجيل الدخول) تُرسل إلى خادمنا ومزوّد الذكاء الاصطناعي (Anthropic) لتوليد الرد فقط، ولا تُستخدم لأي غرض آخر. الطلبات المحوّلة للدعم تُحفظ لدينا مع اسم المستخدم لمتابعتها، وتُرسل بالبريد إلى ${SUPPORT_EMAIL}.</p>
-<h2>الشراء والتحديثات</h2><p>النسخة الكاملة شراء لمرة واحدة عبر Google Play، وتشمل حق تنزيل التطبيق وجميع تحديثاته المستقبلية لنفس الحساب، وإعادة تثبيته على جهازك. الحساب يعمل على جهاز واحد، ويمكن نقله لجهاز جديد بعد الشراء، وعندها يُزال الجهاز القديم ولا يمكنه الدخول لهذا الحساب مرة أخرى. الفترة التجريبية مرة واحدة لكل جهاز. إذا استُرد مبلغ الشراء من Google Play يعود الحساب إلى النسخة المنتهية.</p>
+<h2>الشراء والاشتراكات والتحديثات</h2><p>بعد الفترة التجريبية (7 أيام) والفترة المجانية المحدودة (14 يومًا) تختار اشتراكًا يتجدد تلقائيًا (شهر أو 3 أو 6 شهور) أو النسخة مدى الحياة بشراء لمرة واحدة، عبر Google Play أو App Store. نحفظ نوع الباقة وتاريخ انتهائها ورقم الطلب ورمز الشراء فقط. الاشتراك والنسخة مدى الحياة يشملان تحديثات التطبيق لنفس الحساب. الحساب يعمل على جهاز واحد، ويمكن نقله لجهاز جديد مع باقة فعّالة، وعندها يُزال الجهاز القديم ولا يمكنه الدخول لهذا الحساب مرة أخرى. الفترة التجريبية مرة واحدة لكل جهاز. إذا استُرد مبلغ الشراء من Google Play يعود الحساب إلى النسخة المنتهية.</p>
 <h2>حذف الحساب</h2><p>يمكنك حذف حسابك من داخل التطبيق (الحساب ← حذف الحساب) أو من <a href="/delete-account">صفحة حذف الحساب</a> (لحسابات Google وApple تُرسل طلبًا ونحذفه خلال 7 أيام). يُحذف الحساب وبيانات الأجهزة والجلسات فورًا. بيانات مشاريعك على جهازك ونسخك الاحتياطية تبقى ملكك وتحت تحكمك.</p>
 <h2>الشروط والأحكام</h2><p>استخدام التطبيق يخضع <a href="/terms">للشروط والأحكام</a>.</p>
 <h2>التواصل</h2><p>${CONTACT}</p>
@@ -897,7 +1038,7 @@ const PRIVACY = page('سياسة الخصوصية وشروط الاستخدام 
 <p>If you add your email or mobile number we keep them only to confirm your account, reset your password and for two-step sign-in. Email codes are sent through our email provider and SMS / WhatsApp codes through Twilio; your details are never used for marketing. After each successful check your device receives a signed pass that lets the app work without internet for ${OFFLINE_DAYS} days (during the trial, until it ends); then it needs a connection again.</p>
 <p>Security: all traffic to our server is encrypted (HTTPS); a sign-in expires after ${SESSION_DAYS} days without use; the app may use Google Play Integrity to confirm it is the genuine app on a genuine device (Google sends us only the verdict); app data is excluded from Android's automatic backup and device-to-device transfer; backup files can be protected with a password (AES-256 encryption — a forgotten password cannot be recovered). If a Google Play purchase is refunded, the account returns to the expired state.</p>
 <p>Questions to the in-app support assistant (when signed in) are sent to our server and our AI provider (Anthropic) only to produce the reply. Issues passed to support are stored with your username and emailed to ${SUPPORT_EMAIL}.</p>
-<p>The full version is a one-time Google Play purchase and includes the right to download the app and all its future updates on the same account, and to reinstall it on your device. An account works on one device; after purchase it can be moved to a new device, and the old device is then removed and cannot sign in to that account again. You can delete your account in the app or at <a href="/delete-account">/delete-account</a> (Google / Apple accounts: send a request there and we delete it within 7 days). Contact: ${CONTACT}</p></div>`);
+<p>After the 7-day trial and the limited 14-day free period you choose an auto-renewing subscription (1, 3 or 6 months) or the lifetime version with a one-time purchase, through Google Play or the App Store; we keep only the plan, its end date, the order number and the purchase token. A subscription and the lifetime version include app updates on the same account. An account works on one device; with an active plan it can be moved to a new device, and the old device is then removed and cannot sign in to that account again. You can delete your account in the app or at <a href="/delete-account">/delete-account</a> (Google / Apple accounts: send a request there and we delete it within 7 days). Contact: ${CONTACT}</p></div>`);
 
 const TERMS_PAGE = termsHtml();
 const htmlEsc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -920,26 +1061,60 @@ document.getElementById('f').onsubmit=async e=>{e.preventDefault();const j=await
 document.getElementById('f2').onsubmit=async e=>{e.preventDefault();const j=await post('/delete-account/request',e.target);document.getElementById('m2').textContent=j.ok?'تم استلام طلبك. سنتواصل معك للتأكيد ثم نحذف الحساب.':'تعذر الإرسال، حاول لاحقًا.';};</script>`);
 
 const ADMIN_PAGE = page('إدارة تشطيباتى', `<h1>إدارة حسابات تشطيباتى</h1>
-<div class="card" id="tot">…</div>
-<div class="card" style="display:flex;gap:8px;flex-wrap:wrap"><input id="q" placeholder="بحث باسم المستخدم" style="flex:1;min-width:180px"><button id="go">بحث</button></div>
+<style>.sub{background:#efe3f7;color:#6a2c8c}.free{background:#fbf0d6;color:#8a5a00}.chips{display:flex;gap:8px;flex-wrap:wrap}.chip{background:#fff;color:#1b2420;border:1px solid #c4cbc2;border-radius:999px;padding:6px 12px;min-height:34px}
+.chip b{margin-inline-start:4px}.chip[aria-pressed=true]{background:#1f4e8c;color:#fff;border-color:#1f4e8c}.filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}.filters label{display:flex;flex-direction:column;gap:4px;font-size:13px}
+@media (prefers-color-scheme:dark){.chip{background:#19201d;color:#e6ebe7;border-color:#2b3531}.sub{background:#3a2747;color:#e3c6f5}.free{background:#3d3215;color:#f3d48a}}</style>
+<div class="card"><div class="chips" id="tot">…</div><p class="muted" id="tot2" style="margin:10px 0 0"></p></div>
+<div class="card filters">
+ <label>بحث<input id="q" placeholder="اسم المستخدم أو البريد"></label>
+ <label>الحالة<select id="f-state"><option value="">الكل</option><option value="trial">تجريبي (كامل)</option><option value="free">مجاني محدود</option><option value="sub">اشتراك</option><option value="paid">مدى الحياة</option><option value="expired">منتهي</option></select></label>
+ <label>الباقة<select id="f-plan"><option value="">كل الباقات</option><option value="m1">شهر</option><option value="m3">3 شهور</option><option value="m6">6 شهور</option><option value="lifetime">مدى الحياة</option></select></label>
+ <label>المتجر<select id="f-store"><option value="">الكل</option><option value="google_play">Google Play</option><option value="app_store">App Store</option><option value="admin">من الإدارة</option></select></label>
+ <label>التجديد<select id="f-renew"><option value="">الكل</option><option value="soon">ينتهي خلال 7 أيام</option><option value="off">التجديد التلقائي متوقف</option><option value="lapsed">انتهى اشتراكه آخر 30 يوم</option></select></label>
+ <label>&nbsp;<button id="go">تطبيق</button></label>
+</div>
 <h2>طلبات الدعم</h2><div class="card wrap" id="tickets">…</div>
-<h2>الحسابات</h2><div class="card wrap"><table><thead><tr><th>المستخدم</th><th>الحالة</th><th>الأجهزة</th><th>الشراء</th><th>إجراءات</th></tr></thead><tbody id="rows"></tbody></table></div>
+<h2>الحسابات <span class="muted" id="count"></span></h2><div class="card wrap"><table><thead><tr><th>المستخدم</th><th>الحالة والباقة</th><th>الأجهزة</th><th>المشتريات</th><th>إجراءات</th></tr></thead><tbody id="rows"></tbody></table></div>
 <script>
 const $=s=>document.querySelector(s);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const d=x=>x?new Date(x).toLocaleString('ar-EG-u-nu-latn',{dateStyle:'medium',timeStyle:'short'}):'—';
-const st={paid:'مدفوع',trial:'تجريبي',expired:'انتهت التجربة'};
-async function load(){const r=await fetch('/admin/api/accounts?q='+encodeURIComponent($('#q').value));const j=await r.json();
- $('#tot').innerHTML='الحسابات: <b>'+j.totals.all+'</b> · مدفوع: <b>'+j.totals.paid+'</b> · في التجربة: <b>'+j.totals.trial+'</b>';
- $('#rows').innerHTML=j.accounts.map(a=>'<tr><td><b>'+esc(a.username)+'</b>'+(a.google?' <span class="pill trial">Google</span>':'')+(a.apple?' <span class="pill trial">Apple</span>':'')+(a.email?'<br><span class="muted">'+esc(a.email)+(a.email_verified?' ✓':'')+'</span>':'')+(a.phone?'<br><span class="muted" dir="ltr">'+esc(a.phone)+(a.phone_verified?' ✓':'')+'</span>':'')+(a.twofa?' <span class="pill paid">2FA</span>':'')+'<br><span class="muted">'+(a.terms_version?'الشروط '+esc(a.terms_version)+' · '+d(a.terms_at):'لم يوافق على الشروط بعد')+'</span>'+'<br><span class="muted">'+d(a.created_at)+'</span>'+(a.note?'<br><span class="muted">'+esc(a.note)+'</span>':'')+'</td>'+
- '<td><span class="pill '+a.state+'">'+st[a.state]+'</span><br><span class="muted">'+(a.paid?('منذ '+d(a.paid_at)+' · '+esc(a.paid_via||'')):('حتى '+d(a.trial_ends)))+'</span></td>'+
+const dd=x=>x?new Date(x).toLocaleDateString('ar-EG-u-nu-latn',{dateStyle:'medium'}):'—';
+const st={paid:'مدى الحياة',sub:'اشتراك',trial:'تجريبي',free:'مجاني محدود',expired:'منتهي'};
+const pl={m1:'شهر',m3:'3 شهور',m6:'6 شهور',lifetime:'مدى الحياة'};
+const prod={tashtibati_full:'مدى الحياة',tashtibati_m1:'شهر',tashtibati_m3:'3 شهور',tashtibati_m6:'6 شهور'};
+const storeN={google_play:'Google Play',app_store:'App Store',admin:'الإدارة',test:'اختبار'};
+const F=()=>({q:$('#q').value,state:$('#f-state').value,plan:$('#f-plan').value,store:$('#f-store').value,renew:$('#f-renew').value});
+function setF(k,v){['state','plan','renew'].forEach(x=>{$('#f-'+x).value='';});if(k)$('#f-'+k).value=v;load();}
+const userCell=a=>'<td><b>'+esc(a.username)+'</b>'+(a.google?' <span class="pill trial">Google</span>':'')+(a.apple?' <span class="pill trial">Apple</span>':'')+(a.email?'<br><span class="muted">'+esc(a.email)+(a.email_verified?' ✓':'')+'</span>':'')+(a.phone?'<br><span class="muted" dir="ltr">'+esc(a.phone)+(a.phone_verified?' ✓':'')+'</span>':'')+(a.twofa?' <span class="pill paid">2FA</span>':'')+'<br><span class="muted">'+(a.terms_version?'الشروط '+esc(a.terms_version)+' · '+d(a.terms_at):'لم يوافق على الشروط بعد')+'</span>'+'<br><span class="muted">'+d(a.created_at)+'</span>'+(a.note?'<br><span class="muted">'+esc(a.note)+'</span>':'')+'</td>';
+function stateCell(a){let h='<span class="pill '+a.state+'">'+st[a.state]+'</span>';
+ if(a.state==='paid')h+='<br><span class="muted">منذ '+dd(a.paid_at)+' · '+esc(storeN[a.paid_via]||a.paid_via||'')+'</span>';
+ else if(a.state==='sub')h+=' <b>'+esc(pl[a.cur_plan]||a.cur_plan||'')+'</b><br><span class="muted">حتى '+dd(a.plan_until)+' · '+esc(storeN[a.plan_store]||a.plan_store||'')+(a.plan_renews===false?' · <b>التجديد متوقف</b>':' · يتجدد')+'</span>';
+ else if(a.state==='trial')h+='<br><span class="muted">التجربة حتى '+dd(a.trial_ends)+'</span>';
+ else if(a.state==='free')h+='<br><span class="muted">المجاني حتى '+dd(a.freeEnds)+' · قراءة مخطط '+(a.free_plan_reads||0)+'</span>';
+ else h+='<br><span class="muted">'+(a.plan_until?'آخر اشتراك انتهى '+dd(a.plan_until):'انتهى المجاني '+dd(a.freeEnds))+'</span>';
+ return h;}
+function buyCell(a){return (a.purchases||[]).map(p=>'<b>'+esc(prod[p.product]||p.product||'')+'</b> · '+esc(p.state)+' · '+esc(storeN[p.store]||'')+(p.expires?'<br><span class="muted">ينتهي '+dd(p.expires)+'</span>':'')+'<br><span class="muted">'+esc(p.order||'')+'</span>').join('<hr style="border:0;border-top:1px solid #e3e6e0">')||'—';}
+function actions(a){return (a.paid?'<button class="ghost" data-a="markUnpaid" data-id="'+a.id+'">إلغاء مدى الحياة</button>':'<button data-a="markPaid" data-id="'+a.id+'">تفعيل مدى الحياة</button>')+
+ '<select data-grant="'+a.id+'"><option value="">منح اشتراك…</option><option value="1">شهر</option><option value="3">3 شهور</option><option value="6">6 شهور</option></select>'+
+ (a.state==='sub'?'<button class="ghost" data-a="endSub" data-id="'+a.id+'">إنهاء الاشتراك</button>':'')+
+ (a.blocked?'<button class="ghost" data-a="unblockDevices" data-id="'+a.id+'">إلغاء حظر '+a.blocked+' جهاز قديم</button>':'')+'<button class="ghost" data-a="extendTrial" data-id="'+a.id+'">+7 أيام تجربة</button><button class="ghost" data-a="resetDevices" data-id="'+a.id+'">إعادة ضبط الأجهزة</button>'+(a.twofa?'<button class="ghost" data-a="disable2fa" data-id="'+a.id+'">إيقاف التحقق بخطوتين</button>':'')+'<button class="ghost" data-a="note" data-id="'+a.id+'">ملاحظة</button><button class="ghost" data-a="delete" data-id="'+a.id+'">حذف</button>';}
+async function load(){const f=F();const r=await fetch('/admin/api/accounts?'+new URLSearchParams(f));const j=await r.json();const t=j.totals;
+ const c=(k,v,lab,n)=>'<button class="chip" data-f="'+k+'" data-v="'+v+'" aria-pressed="'+(k?f[k]===v:!f.state&&!f.plan&&!f.renew)+'">'+lab+'<b>'+n+'</b></button>';
+ $('#tot').innerHTML=c('','','الكل',t.all)+c('state','trial','تجريبي',t.trial)+c('state','free','مجاني محدود',t.free)+c('state','sub','اشتراك',t.sub)+c('state','paid','مدى الحياة',t.paid)+c('state','expired','منتهي',t.expired)
+  +c('plan','m1','شهر',t.m1)+c('plan','m3','3 شهور',t.m3)+c('plan','m6','6 شهور',t.m6)+c('renew','soon','ينتهي خلال 7 أيام',t.soon)+c('renew','off','التجديد متوقف',t.renew_off)+c('renew','lapsed','انتهى آخر 30 يوم',t.lapsed);
+ $('#tot2').textContent='حسابات جديدة آخر 7 أيام: '+t.new7+' · الفترة المجانية بعد التجربة: '+j.freeDays+' يوم';
+ $('#count').textContent='('+j.accounts.length+')';
+ $('#rows').innerHTML=j.accounts.map(a=>'<tr>'+userCell(a)+'<td>'+stateCell(a)+'</td>'+
  '<td>'+((a.devices||[]).map(x=>esc(x.kind==='tablet'?'تابلت':'هاتف')+' '+esc(x.model)+' <button class="ghost" data-a="removeDevice" data-id="'+a.id+'" data-dev="'+x.id+'">إزالة</button><br><span class="muted">'+d(x.lastSeen)+'</span>').join('<br>')||'—')+'</td>'+
- '<td>'+((a.purchases||[]).map(p=>esc(p.order||'')+' <b>'+esc(p.state)+'</b>').join('<br>')||'—')+'</td>'+
- '<td style="display:flex;gap:6px;flex-wrap:wrap">'+(a.paid?'<button class="ghost" data-a="markUnpaid" data-id="'+a.id+'">إلغاء التفعيل</button>':'<button data-a="markPaid" data-id="'+a.id+'">تفعيل كمدفوع</button>')+
- (a.blocked?'<button class="ghost" data-a="unblockDevices" data-id="'+a.id+'">إلغاء حظر '+a.blocked+' جهاز قديم</button>':'')+'<button class="ghost" data-a="extendTrial" data-id="'+a.id+'">+7 أيام</button><button class="ghost" data-a="resetDevices" data-id="'+a.id+'">إعادة ضبط الأجهزة</button>'+(a.twofa?'<button class="ghost" data-a="disable2fa" data-id="'+a.id+'">إيقاف التحقق بخطوتين</button>':'')+'<button class="ghost" data-a="note" data-id="'+a.id+'">ملاحظة</button></td></tr>').join('');}
-document.addEventListener('click',async e=>{const b=e.target.closest('[data-a]');if(!b)return;const body={id:+b.dataset.id,action:b.dataset.a,deviceId:+b.dataset.dev||undefined,days:7};
+ '<td>'+buyCell(a)+'</td><td style="display:flex;gap:6px;flex-wrap:wrap">'+actions(a)+'</td></tr>').join('')||'<tr><td colspan="5" class="muted">لا توجد حسابات بهذه الشروط</td></tr>';}
+const act=async body=>{await fetch('/admin/api/account',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});load();};
+document.addEventListener('click',async e=>{const ch=e.target.closest('[data-f]');if(ch){setF(ch.dataset.f,ch.dataset.v);return;}
+ const b=e.target.closest('[data-a]');if(!b)return;const body={id:+b.dataset.id,action:b.dataset.a,deviceId:+b.dataset.dev||undefined,days:7};
  if(body.action==='note'){const n=prompt('ملاحظة');if(n==null)return;body.note=n;}
- if(['resetDevices','markUnpaid','removeDevice','unblockDevices','disable2fa'].includes(body.action)&&!confirm('تأكيد؟'))return;
- await fetch('/admin/api/account',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});load();});
+ if(['resetDevices','markUnpaid','removeDevice','unblockDevices','disable2fa','endSub','delete'].includes(body.action)&&!confirm('تأكيد؟'))return;
+ act(body);});
+document.addEventListener('change',e=>{const s=e.target.closest('[data-grant]');if(s&&s.value){if(confirm('منح اشتراك '+s.options[s.selectedIndex].text+'؟'))act({id:+s.dataset.grant,action:'grantSub',months:+s.value});else s.value='';return;}
+ if(e.target.closest('.filters select'))load();});
 async function loadT(){const j=await (await fetch('/admin/api/tickets')).json();
  $('#tickets').innerHTML=j.tickets.length?'<table><thead><tr><th>#</th><th>المستخدم</th><th>المشكلة</th><th>الحالة</th></tr></thead><tbody>'+j.tickets.map(t=>'<tr><td>'+t.id+'<br><span class="muted">'+d(t.created_at)+'</span></td><td>'+esc(t.username||'—')+'<br><span class="muted">'+esc(t.contact||'')+' '+esc(t.device||'')+'</span></td><td><b>'+esc(t.subject||'')+'</b><br><span style="white-space:pre-wrap">'+esc(t.message||'')+'</span>'+((t.transcript||[]).length?'<details><summary class="muted">المحادثة</summary>'+(t.transcript||[]).map(m=>'<p><b>'+(m.role==='assistant'?'المساعد':'المستخدم')+':</b> '+esc(m.content)+'</p>').join('')+'</details>':'')+'</td><td><span class="pill '+(t.status==='open'?'expired':'paid')+'">'+(t.status==='open'?'مفتوح':'مغلق')+'</span><br><button class="ghost" data-t="'+t.id+'" data-s="'+(t.status==='open'?'closed':'open')+'">'+(t.status==='open'?'إغلاق':'إعادة فتح')+'</button></td></tr>').join('')+'</tbody></table>':'<p class="muted">لا توجد طلبات.</p>';}
 document.addEventListener('click',async e=>{const b=e.target.closest('[data-t]');if(!b)return;await fetch('/admin/api/ticket',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id:+b.dataset.t,status:b.dataset.s})});loadT();});
@@ -1004,4 +1179,4 @@ async function connectDb() {
 setInterval(() => { if (dbReady) q(`delete from sessions where last_seen < now() - ($1 || ' days')::interval`, [String(SESSION_DAYS)]).catch(() => {}); }, 3600e3).unref();
 if (require.main === module) { server.listen(PORT, () => console.log('tashtibati server on', PORT)); connectDb(); }
 else dbReady = true;
-module.exports = { server, migrate, pool, checkVoided };
+module.exports = { server, migrate, pool, checkVoided, checkPlaySubs };
