@@ -1133,7 +1133,7 @@ loadT();$('#go').onclick=load;$('#q').onkeydown=e=>{if(e.key==='Enter')load();};
 // ---------- server ----------
 function send(res, status, body, type = 'application/json; charset=utf-8', extra = {}) {
   const site = res.isAdmin ? { 'x-frame-options': 'DENY', 'content-security-policy': "frame-ancestors 'none'", 'referrer-policy': 'no-referrer' }
-    : { 'access-control-allow-origin': '*', 'access-control-allow-headers': 'authorization, content-type', 'access-control-allow-methods': 'GET, POST, OPTIONS', 'x-frame-options': 'SAMEORIGIN' };
+    : { 'access-control-allow-origin': '*', 'access-control-allow-headers': 'authorization, content-type, x-terms', 'access-control-allow-methods': 'GET, POST, OPTIONS', 'x-frame-options': 'SAMEORIGIN' };
   res.writeHead(status, { 'content-type': type, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'strict-transport-security': 'max-age=31536000', ...site, ...extra });
   res.end(typeof body === 'string' ? body : JSON.stringify(body));
 }
